@@ -1,0 +1,182 @@
+syntax = "proto3";
+
+package proto; // Use a simple package name
+
+option go_package = "./proto"; // Go package path
+
+// --------------------
+// Core Data Structures
+// --------------------
+
+message Transaction {
+  string sender = 1;
+  string receiver = 2;
+  int32 amount = 3;
+}
+
+message ClientRequest {
+  Transaction transaction = 1;
+  int64 timestamp = 2;       // Unique & ordered per client
+  string client_id = 3;      // Identifier for the client application/session
+}
+
+// Represents a digest (hash) of a message
+message Digest {
+  bytes hash = 1; // e.g., SHA-256 output
+}
+
+// Represents a digital signature
+message Signature {
+  bytes signer_id_bytes = 1; // Can represent the node ID or public key identifier
+  bytes value = 2;           // The actual signature bytes (e.g., ECDSA signature)
+  // We'll store ReplicaId separately in messages that use this
+}
+
+// General Acknowledgment message
+message Ack {
+  bool success = 1;
+  string error_message = 2; // Optional error details
+}
+
+// --------------------
+// Normal Case Messages (Linear PBFT)
+// --------------------
+
+// Phase 1: Primary sends to Backups
+message PrePrepareRequest {
+  int32 view = 1;
+  int64 sequence_number = 2;
+  Digest digest = 3;           // Digest of the client request
+  ClientRequest request = 4;   // The full client request message
+  Signature signature = 5;     // Primary's signature over <PRE-PREPARE, v, n, d>
+}
+
+// Phase 2a: Backups send to Primary
+message PrepareRequest {
+  int32 view = 1;
+  int64 sequence_number = 2;
+  Digest digest = 3;       // Digest received in PrePrepare
+  int32 replica_id = 4;    // ID of the backup sending this
+  Signature signature = 5; // Backup's signature over <PREPARE, v, n, d, i>
+}
+
+// Phase 2b: Primary sends proof to Backups
+message FullPrepareRequest {
+  PrePrepareRequest pre_prepare_proof = 1; // The original PrePrepare with primary sig
+  repeated PrepareRequest prepare_proofs = 2; // A quorum (2f) of valid Prepare messages from backups
+}
+
+// Phase 3a: Backups send to Primary
+message CommitRequest {
+  int32 view = 1;
+  int64 sequence_number = 2;
+  Digest digest = 3;       // Digest received/verified
+  int32 replica_id = 4;    // ID of the backup sending this
+  Signature signature = 5; // Backup's signature over <COMMIT, v, n, d, i>
+}
+
+// Phase 3b: Primary sends proof to Backups
+message FullCommitRequest {
+  int32 view = 1;
+  int64 sequence_number = 2;
+  Digest digest = 3;
+  repeated CommitRequest commit_proofs = 4; // A quorum (2f) of valid Commit messages from backups
+}
+
+
+// Final reply to the client
+message ClientReply {
+  int32 view = 1;          // View in which the request was executed
+  int64 timestamp = 2;     // Timestamp of the original request
+  string client_id = 3;    // Client who sent the request
+  int32 replica_id = 4;    // ID of the replica sending the reply
+  string result = 5;       // "success" or "failed" (or other details)
+  Signature signature = 6; // Replica's signature over <REPLY, v, t, c, i, r>
+}
+
+// --------------------
+// View Change Messages (Standard PBFT)
+// --------------------
+
+message Checkpoint {
+  int64 sequence_number = 1; // Sequence number of the last executed request in the checkpoint
+  Digest state_digest = 2;   // Digest of the application state
+  int32 replica_id = 3;      // ID of the replica creating the checkpoint
+  Signature signature = 4;   // Replica's signature over <CHECKPOINT, n, d, i>
+}
+
+// Proof for a prepared message (used in ViewChange)
+message PProof {
+  PrePrepareRequest pre_prepare_req = 1; // The validated PrePrepare
+  repeated PrepareRequest prepare_reqs = 2; // The 2f matching Prepare messages
+}
+
+message ViewChangeRequest {
+  int32 new_view = 1;                 // The target view v+1
+  int64 checkpoint_seq_num = 2;       // Sequence number n of the latest stable checkpoint
+  repeated Checkpoint checkpoint_proof = 3; // Set C: 2f+1 Checkpoint messages for n
+  repeated PProof prepared_proof = 4; // Set P: Proofs for prepared messages > n
+  int32 replica_id = 5;               // ID of the replica sending this
+  Signature signature = 6;            // Replica's signature over <VIEW-CHANGE, v+1, n, C, P, i>
+}
+
+message NewViewRequest {
+  int32 new_view = 1;                       // The new view v+1 being established
+  repeated ViewChangeRequest view_change_proof = 2; // Set V: 2f+1 valid ViewChange messages
+  repeated PrePrepareRequest reproposed_requests = 3; // Set O: PrePrepares for requests determined from V
+  Signature signature = 4;                  // New primary's signature over <NEW-VIEW, v+1, V, O>
+}
+
+// --------------------
+// State Query Messages (for print* commands)
+// --------------------
+message StateRequest {
+  int64 sequence_number = 1; // Optional: For printstatus
+}
+
+message LogEntry {
+  int64 sequence_number = 1;
+  string status = 2;       // e.g., "pre-prepared", "prepared", "committed", "executed"
+  string content = 3;      // String representation of the request or "no-op"
+  int32 view = 4;          // View number associated with this entry
+}
+
+message StateReply {
+  int32 node_id = 1;
+  int32 current_view = 2;
+  int64 last_sequence_number = 3;
+  int64 last_executed_sequence = 4;
+  map<string, int32> db = 5;         // Database state
+  repeated LogEntry log = 6;         // Transaction log (simplified for print)
+  string status_for_seq = 7;         // Specific status if requested
+  
+  // *** NEW FIELD ***
+  repeated ViewChangeRequest view_change_history = 8; // For PrintView command
+}
+
+
+// --------------------
+// gRPC Service Definition
+// --------------------
+
+service PbftNode {
+  // Client interaction
+  rpc SubmitRequest(ClientRequest) returns (ClientReply) {} // Primary handles, others might forward
+
+  // Normal Case RPCs
+  rpc SendPrePrepare(PrePrepareRequest) returns (Ack) {} // Primary -> Backups
+  rpc SendPrepare(PrepareRequest) returns (Ack) {}       // Backups -> Primary (Linear)
+  rpc SendFullPrepare(FullPrepareRequest) returns (Ack) {} // Primary -> Backups
+  rpc SendCommit(CommitRequest) returns (Ack) {}         // Backups -> Primary (Linear)
+  rpc SendFullCommit(FullCommitRequest) returns (Ack) {}   // Primary -> Backups
+
+  // View Change RPCs
+  rpc SendViewChange(ViewChangeRequest) returns (Ack) {} // All -> All
+  rpc SendNewView(NewViewRequest) returns (Ack) {}       // New Primary -> Backups
+
+  // Checkpointing RPCs
+  rpc SendCheckpoint(Checkpoint) returns (Ack) {}       // All -> All (periodically)
+
+  // State Query RPC (for interactive commands)
+  rpc GetNodeState(StateRequest) returns (StateReply) {}
+}
