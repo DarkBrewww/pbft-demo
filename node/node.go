@@ -7,16 +7,14 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 
-	//"encoding/asn1" // For invalid signature attack
 	"encoding/gob"
 	"fmt"
 	"log"
 
-	//"math/big" // For invalid signature attack
 	"regexp"
-	"sort"    // Import for sorting log keys
-	"strconv" // For converting string to int in dark attack parsing
-	"strings" // For parsing in-dark attack
+	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -24,21 +22,23 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/proto"
 
-	pb "bft-DarkBrewww/proto" // CORRECTED IMPORT
+	pb "bft-DarkBrewww/proto"
 )
 
-// Define node states
 type NodeState string
 
 const (
 	StateNormal       NodeState = "Normal"
 	StateViewChanging NodeState = "ViewChanging"
 
-	// Request timer duration
-	RequestTimeout = 5 * time.Second
+	RequestTimeout    = 5 * time.Second
+	ViewChangeTimeout = 10 * time.Second
+
+	CheckpointInterval = int64(10)
+
+	WatermarkRange = int64(20)
 )
 
-// Define log entry statuses
 const (
 	StatusNone        = ""
 	StatusPrePrepared = "pre-prepared"
@@ -47,23 +47,20 @@ const (
 	StatusExecuted    = "executed"
 )
 
-// Internal representation of a log entry for a specific request
 type InternalLogEntry struct {
 	SequenceNumber int64
 	View           int32
 	Digest         []byte
-	Request        *pb.ClientRequest // Store the full request
-	Status         string            // e.g., "pre-prepared", "prepared", "committed", "executed"
+	Request        *pb.ClientRequest
+	Status         string
 
-	// Proofs needed for PBFT state transfer and linear commit
-	PrePrepareMsg *pb.PrePrepareRequest      // The message that started it all for this node
-	PrepareVotes  map[int]*pb.PrepareRequest // replicaID -> PrepareMsg (received by primary or backup)
-	CommitVotes   map[int]*pb.CommitRequest  // replicaID -> CommitMsg (received by primary or backup)
-	FullPrepareRx bool                       // Flag if FullPrepare was received by backup
-	FullCommitRx  bool                       // Flag if FullCommit was received by backup
+	PrePrepareMsg *pb.PrePrepareRequest
+	PrepareVotes  map[int]*pb.PrepareRequest
+	CommitVotes   map[int]*pb.CommitRequest
+	FullPrepareRx bool
+	FullCommitRx  bool
 }
 
-// Node struct holds the state for a single PBFT replica
 type Node struct {
 	pb.UnimplementedPbftNodeServer
 
@@ -71,46 +68,41 @@ type Node struct {
 	NodeAddrs    map[int]string
 	F            int
 	N            int
-	QuorumSize   int // 2f+1
-	ClientQuorum int // f+1
+	QuorumSize   int
+	ClientQuorum int
 
-	// --- ATTACK FIELDS ---
-	AttackModes         map[string]bool // Stores "none", "crash", "sign", "equivocation", "time", "dark"
-	darkTargets         map[int]bool    // Parsed set of targets for 'dark'
-	equivocationTargets map[int]bool    // Parsed set of targets for 'equivocation'
+	AttackModes         map[string]bool
+	darkTargets         map[int]bool
+	equivocationTargets map[int]bool
 	State               NodeState
 	View                int32
-	SeqNum              int64                     // Next sequence number to assign by primary
-	LastExecuted        int64                     // Last sequence number *successfully executed*
-	Watermarks          struct{ Low, High int64 } // Checkpoint watermarks
+	SeqNum              int64
+	LastExecuted        int64
+	Watermarks          struct{ Low, High int64 }
 
-	MessageLog map[int64]*InternalLogEntry // seqNum -> LogEntry (using internal struct)
+	MessageLog map[int64]*InternalLogEntry
 
 	DB map[string]int32
 
 	PrivateKey *ecdsa.PrivateKey
-	PublicKeys map[int]*ecdsa.PublicKey // id -> key
+	PublicKeys map[int]*ecdsa.PublicKey
 
 	mu          sync.Mutex
 	grpcClients map[int]pb.PbftNodeClient
 	clientConn  map[int]*grpc.ClientConn
 
-	// Map to store channels for pending client replies
-	pendingClientReplies map[string]chan *pb.ClientReply // key (client-timestamp) -> channel
+	pendingClientReplies map[string]chan *pb.ClientReply
 
-	// --- VIEW CHANGE FIELDS ---
-	// Stores received view change messages
-	// key = newView, value = map[replicaID] -> message
 	viewChangeVotes map[int32]map[int]*pb.ViewChangeRequest
 
-	// Timers
-	requestTimers map[int64]*time.Timer // seqNum -> Timer
-	// viewTimer     *time.Timer // TODO: Add a timer for the view change process itself
+	requestTimers map[int64]*time.Timer
+	viewTimer     *time.Timer
+
+	//stableCheckpoints    map[int64]*pb.CheckpointProof
+	//checkpointVotes      map[int64]map[int]*pb.Checkpoint
+	//lastStableCheckpoint int64
 }
 
-// NewNode creates and initializes a new PBFT node
-// Now accepts attackType
-// *** MODIFIED: Accepts the new attackString ***
 func NewNode(id int, addrs map[int]string, f int, privKey *ecdsa.PrivateKey, pubKeys map[int]*ecdsa.PublicKey, attackString string) (*Node, error) {
 	n := len(addrs)
 	if n < (3*f + 1) {
@@ -120,11 +112,10 @@ func NewNode(id int, addrs map[int]string, f int, privKey *ecdsa.PrivateKey, pub
 		return nil, fmt.Errorf("node ID %d out of range (0-%d)", id, n-1)
 	}
 
-	// --- Parse Attack Mode ---
 	attackModes := make(map[string]bool)
 	darkTargets := make(map[int]bool)
 	equivocationTargets := make(map[int]bool)
-	re := regexp.MustCompile(`n(\d+)`) // Regex to find node numbers like n1, n6, etc.
+	re := regexp.MustCompile(`n(\d+)`)
 
 	attacks := strings.Split(attackString, ";")
 	for _, attack := range attacks {
@@ -142,7 +133,7 @@ func NewNode(id int, addrs map[int]string, f int, privKey *ecdsa.PrivateKey, pub
 					matches := re.FindAllStringSubmatch(params, -1)
 					for _, match := range matches {
 						targetID, _ := strconv.Atoi(match[1])
-						darkTargets[targetID-1] = true // 1-based in CSV to 0-based internal
+						darkTargets[targetID-1] = true
 					}
 				}
 			}
@@ -155,7 +146,7 @@ func NewNode(id int, addrs map[int]string, f int, privKey *ecdsa.PrivateKey, pub
 					matches := re.FindAllStringSubmatch(params, -1)
 					for _, match := range matches {
 						targetID, _ := strconv.Atoi(match[1])
-						equivocationTargets[targetID-1] = true // 1-based in CSV to 0-based internal
+						equivocationTargets[targetID-1] = true
 					}
 				}
 			}
@@ -170,7 +161,6 @@ func NewNode(id int, addrs map[int]string, f int, privKey *ecdsa.PrivateKey, pub
 			attackModes["crash"] = true
 		}
 	}
-	// --- End Parse Attack Mode ---
 
 	node := &Node{
 		ID:                   id,
@@ -179,14 +169,14 @@ func NewNode(id int, addrs map[int]string, f int, privKey *ecdsa.PrivateKey, pub
 		N:                    n,
 		QuorumSize:           2*f + 1,
 		ClientQuorum:         f + 1,
-		AttackModes:          attackModes, // *** MODIFIED ***
+		AttackModes:          attackModes,
 		darkTargets:          darkTargets,
 		equivocationTargets:  equivocationTargets,
 		State:                StateNormal,
 		View:                 0,
 		SeqNum:               0,
 		LastExecuted:         0,
-		Watermarks:           struct{ Low, High int64 }{0, 1000},
+		Watermarks:           struct{ Low, High int64 }{0, WatermarkRange},
 		MessageLog:           make(map[int64]*InternalLogEntry),
 		DB:                   make(map[string]int32),
 		PrivateKey:           privKey,
@@ -196,6 +186,9 @@ func NewNode(id int, addrs map[int]string, f int, privKey *ecdsa.PrivateKey, pub
 		pendingClientReplies: make(map[string]chan *pb.ClientReply),
 		requestTimers:        make(map[int64]*time.Timer),
 		viewChangeVotes:      make(map[int32]map[int]*pb.ViewChangeRequest),
+		//stableCheckpoints:    make(map[int64]*pb.CheckpointProof),
+		//checkpointVotes:      make(map[int64]map[int]*pb.Checkpoint),
+		//lastStableCheckpoint: 0,
 	}
 
 	for _, client := range []string{"A", "B", "C", "D", "E", "F", "G", "H", "I", "J"} {
@@ -206,7 +199,6 @@ func NewNode(id int, addrs map[int]string, f int, privKey *ecdsa.PrivateKey, pub
 	return node, nil
 }
 
-// getGrpcClient establishes or retrieves a gRPC client connection
 func (n *Node) getGrpcClient(peerID int) (pb.PbftNodeClient, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -231,7 +223,6 @@ func (n *Node) getGrpcClient(peerID int) (pb.PbftNodeClient, error) {
 	return client, nil
 }
 
-// CloseConnections cleans up gRPC client connections
 func (n *Node) CloseConnections() {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -241,32 +232,22 @@ func (n *Node) CloseConnections() {
 	}
 }
 
-// --- Cryptographic Functions ---
-// In node.go
-
-// sign creates a signature for the core part of a message
 func (n *Node) sign(data []byte) (*pb.Signature, error) {
 	if n.PrivateKey == nil {
 		return nil, fmt.Errorf("private key not initialized for node %d", n.ID)
 	}
 
-	// --- Attack Logic: Invalid Signature ---
-	// *** MODIFIED ***
 	if n.AttackModes["sign"] {
 		log.Printf("Node %d [ATTACK]: Generating INVALID signature", n.ID)
 
-		// Create a normal, valid signature first
 		hash := sha256.Sum256(data)
 		sigBytes, err := ecdsa.SignASN1(rand.Reader, n.PrivateKey, hash[:])
 		if err != nil {
 			return nil, fmt.Errorf("failed to sign data: %w", err)
 		}
 
-		// *** THIS IS THE FIX ***
-		// Corrupt the signature by flipping the last byte.
-		// This is guaranteed to make it invalid.
 		if len(sigBytes) > 0 {
-			sigBytes[len(sigBytes)-1] = ^sigBytes[len(sigBytes)-1] // Flip all bits of the last byte
+			sigBytes[len(sigBytes)-1] = ^sigBytes[len(sigBytes)-1]
 		}
 
 		return &pb.Signature{
@@ -274,9 +255,7 @@ func (n *Node) sign(data []byte) (*pb.Signature, error) {
 			Value:         sigBytes,
 		}, nil
 	}
-	// --- End Attack Logic ---
 
-	// --- Normal Logic ---
 	hash := sha256.Sum256(data)
 	sigBytes, err := ecdsa.SignASN1(rand.Reader, n.PrivateKey, hash[:])
 	if err != nil {
@@ -288,7 +267,6 @@ func (n *Node) sign(data []byte) (*pb.Signature, error) {
 	}, nil
 }
 
-// verify checks a signature against the known public key of the signer
 func (n *Node) verify(signerID int, data []byte, signature *pb.Signature) bool {
 	if signature == nil {
 		log.Printf("Node %d: Verification failed - signature is nil", n.ID)
@@ -307,7 +285,6 @@ func (n *Node) verify(signerID int, data []byte, signature *pb.Signature) bool {
 	return valid
 }
 
-// digest computes a SHA256 hash of the client request using deterministic marshalling
 func digest(m *pb.ClientRequest) ([]byte, error) {
 	reqBytes, err := proto.Marshal(m)
 	if err != nil {
@@ -317,9 +294,6 @@ func digest(m *pb.ClientRequest) ([]byte, error) {
 	return hash[:], nil
 }
 
-// --- Helper Functions for Signing Data ---
-
-// prePrepareDataForSig serializes the core PrePrepare fields for signing/verification
 func prePrepareDataForSig(v int32, n int64, d []byte) ([]byte, error) {
 	var buf bytes.Buffer
 	enc := gob.NewEncoder(&buf)
@@ -335,7 +309,6 @@ func prePrepareDataForSig(v int32, n int64, d []byte) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// prepareDataForSig serializes the core Prepare fields for signing/verification
 func prepareDataForSig(v int32, n int64, d []byte, i int32) ([]byte, error) {
 	var buf bytes.Buffer
 	enc := gob.NewEncoder(&buf)
@@ -354,7 +327,6 @@ func prepareDataForSig(v int32, n int64, d []byte, i int32) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// commitDataForSig serializes the core Commit fields for signing/verification
 func commitDataForSig(v int32, n int64, d []byte, i int32) ([]byte, error) {
 	var buf bytes.Buffer
 	enc := gob.NewEncoder(&buf)
@@ -373,7 +345,6 @@ func commitDataForSig(v int32, n int64, d []byte, i int32) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// clientReplyDataForSig serializes the core ClientReply fields for signing/verification
 func clientReplyDataForSig(v int32, t int64, c string, i int32, r string) ([]byte, error) {
 	var buf bytes.Buffer
 	enc := gob.NewEncoder(&buf)
@@ -395,23 +366,16 @@ func clientReplyDataForSig(v int32, t int64, c string, i int32, r string) ([]byt
 	return buf.Bytes(), nil
 }
 
-// --- Implement gRPC Service Methods ---
-
-// getPrimaryID calculates the primary for a given view
 func (n *Node) getPrimaryID(view int32) int {
 	return int(view) % n.N
 }
 
-// SubmitRequest is called by clients.
-// Implements "Equivocation", "Timing", and Read-Only logic
 func (n *Node) SubmitRequest(ctx context.Context, req *pb.ClientRequest) (*pb.ClientReply, error) {
-	// --- Read-Only Optimistic Path ---
 	tx := req.Transaction
 	if tx != nil && tx.Receiver == "" && tx.Amount == 0 {
 		n.mu.Lock()
 		log.Printf("Node %d received Read-Only request from %s (ts=%d). Executing immediately.", n.ID, req.ClientId, req.Timestamp)
 
-		// Execute immediately against the local state.
 		result := ""
 		if val, ok := n.DB[tx.Sender]; ok {
 			result = fmt.Sprintf("Balance: %d", val)
@@ -535,7 +499,6 @@ func (n *Node) SubmitRequest(ctx context.Context, req *pb.ClientRequest) (*pb.Cl
 
 					var msgToSend *pb.PrePrepareRequest
 
-					// *** THIS IS THE FIX ***
 					// It checks if the peerID is in the map we created.
 					if n.equivocationTargets[peerID] {
 						// peerID is in the equivocation target set: Send the conflicting message
@@ -634,7 +597,6 @@ func (n *Node) SubmitRequest(ctx context.Context, req *pb.ClientRequest) (*pb.Cl
 	}
 }
 
-// createSignedPrePrepare is a helper for the equivocation attack
 func (n *Node) createSignedPrePrepare(v int32, seq int64, d []byte, req *pb.ClientRequest) (*pb.PrePrepareRequest, error) {
 	prePrepareCoreData, err := prePrepareDataForSig(v, seq, d)
 	if err != nil {
@@ -654,9 +616,7 @@ func (n *Node) createSignedPrePrepare(v int32, seq int64, d []byte, req *pb.Clie
 	}, nil
 }
 
-// sendToPeer handles sending any message to a peer, checking for "In-dark" attack
 func (n *Node) sendToPeer(peerID int, msg interface{}, msgType string) {
-	// --- Attack Logic: In-dark ---
 	// Check if the target peerID is in our "dark" list
 	if n.AttackModes["dark"] && n.darkTargets[peerID] {
 		log.Printf("Node %d [ATTACK]: In-dark attack. *NOT* sending %s to target Node %d.", n.ID, msgType, peerID)
@@ -699,12 +659,8 @@ func (n *Node) sendToPeer(peerID int, msg interface{}, msgType string) {
 	}
 }
 
-// SendPrePrepare is called by the primary, handled by backups.
-// Implements "Crash" attack and starts request timer
 func (n *Node) SendPrePrepare(ctx context.Context, req *pb.PrePrepareRequest) (*pb.Ack, error) {
 
-	// --- Attack Logic: Crash (as Backup) ---
-	// As per PDF: (a) fails to send any prepare messages
 	if n.AttackModes["crash"] {
 		log.Printf("Node %d (Backup) [ATTACK]: Crashing. Received PrePrepare for seq %d but will not send Prepare.", n.ID, req.SequenceNumber)
 		n.mu.Lock()
@@ -721,7 +677,6 @@ func (n *Node) SendPrePrepare(ctx context.Context, req *pb.PrePrepareRequest) (*
 			return &pb.Ack{Success: false, ErrorMessage: "digest mismatch"}, nil
 		}
 
-		// Log it but don't send Prepare
 		n.MessageLog[req.SequenceNumber] = &InternalLogEntry{
 			SequenceNumber: req.SequenceNumber,
 			View:           req.View,
@@ -735,9 +690,7 @@ func (n *Node) SendPrePrepare(ctx context.Context, req *pb.PrePrepareRequest) (*
 		log.Printf("Node %d (Backup) [ATTACK]: Logged PrePrepare seq=%d but will NOT send Prepare.", n.ID, req.SequenceNumber)
 		return &pb.Ack{Success: true}, nil // Lie and say we're fine
 	}
-	// --- End Attack Logic ---
 
-	// --- Normal Logic ---
 	n.mu.Lock()
 	log.Printf("Node %d received PrePrepare from primary for seq=%d view=%d", n.ID, req.SequenceNumber, req.View)
 
@@ -811,7 +764,6 @@ func (n *Node) SendPrePrepare(ctx context.Context, req *pb.PrePrepareRequest) (*
 
 	log.Printf("Node %d PrePrepared seq=%d view=%d", n.ID, req.SequenceNumber, req.View)
 
-	// --- START REQUEST TIMER ---
 	// As a backup, if we get a PrePrepare, we start a timer.
 	if timer, ok := n.requestTimers[req.SequenceNumber]; ok {
 		timer.Stop() // Stop and delete any existing timer for this seq
@@ -820,7 +772,6 @@ func (n *Node) SendPrePrepare(ctx context.Context, req *pb.PrePrepareRequest) (*
 		n.handleRequestTimeout(req.SequenceNumber, req.View)
 	})
 	log.Printf("Node %d (Backup) started timer for seq %d", n.ID, req.SequenceNumber)
-	// --- END TIMER LOGIC ---
 
 	prepareCoreData, err := prepareDataForSig(req.View, req.SequenceNumber, req.Digest.Hash, int32(n.ID))
 	if err != nil {
@@ -850,13 +801,10 @@ func (n *Node) SendPrePrepare(ctx context.Context, req *pb.PrePrepareRequest) (*
 	return &pb.Ack{Success: true}, nil
 }
 
-// SendPrepare is called by backups, handled by the primary.
-// Implements "Crash" attack
 func (n *Node) SendPrepare(ctx context.Context, req *pb.PrepareRequest) (*pb.Ack, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
-	// --- Check if we're in a view change ---
 	if n.State == StateViewChanging && req.View < n.View {
 		log.Printf("Node %d: In ViewChanging state, ignoring old Prepare for view %d", n.ID, req.View)
 		return &pb.Ack{Success: false, ErrorMessage: "node in view change"}, nil
@@ -902,19 +850,13 @@ func (n *Node) SendPrepare(ctx context.Context, req *pb.PrepareRequest) (*pb.Ack
 	}
 	entry.PrepareVotes[int(req.ReplicaId)] = req
 
-	// Check for quorum (2f + 1 total = 5).
-	// Primary's "vote" is implicit (it sent the PrePrepare).
-	// So we need 2f = 4 backup votes.
 	if len(entry.PrepareVotes) >= (n.QuorumSize-1) && entry.Status == StatusPrePrepared {
 
-		// --- Attack Logic: Crash (as Primary) ---
-		// As per PDF: (a) refrains from ... send[ing] prepare messages [FullPrepare]
 		if n.AttackModes["crash"] {
 			log.Printf("Node %d (Primary) [ATTACK]: Crashing. Reached Prepare quorum for seq %d but will not send FullPrepare.", n.ID, req.SequenceNumber)
 			entry.Status = StatusPrepared      // Log it
 			return &pb.Ack{Success: true}, nil // Lie and say we're fine
 		}
-		// --- End Attack Logic ---
 
 		entry.Status = StatusPrepared
 		log.Printf("Node %d (Primary) has prepared seq=%d. Broadcasting FullPrepare.", n.ID, req.SequenceNumber)

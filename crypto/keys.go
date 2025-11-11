@@ -1,4 +1,3 @@
-// Create this file at: crypto/keys.go
 package crypto
 
 import (
@@ -9,7 +8,6 @@ import (
 	"os"
 )
 
-// LoadPrivateKey loads a single PEM-encoded EC private key from file
 func LoadPrivateKey(nodeID int) (*ecdsa.PrivateKey, error) {
 	fileName := fmt.Sprintf("key%d.priv", nodeID)
 	keyData, err := os.ReadFile(fileName)
@@ -34,7 +32,6 @@ func LoadPrivateKey(nodeID int) (*ecdsa.PrivateKey, error) {
 	return ecKey, nil
 }
 
-// LoadAllPublicKeys loads all N public keys into a map
 func LoadAllPublicKeys(numNodes int) (map[int]*ecdsa.PublicKey, error) {
 	pubKeys := make(map[int]*ecdsa.PublicKey)
 	for i := 0; i < numNodes; i++ {

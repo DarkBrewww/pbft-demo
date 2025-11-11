@@ -21,7 +21,6 @@ import (
 	pb "bft-DarkBrewww/proto"
 )
 
-// --- System Configuration ---
 const (
 	NumNodes     = 7
 	F            = 2
@@ -31,48 +30,40 @@ const (
 
 var nodeAddresses = make(map[int]string)
 
-// allTestSets holds parsed test sets for runtime access from helper commands
 var allTestSets []TestSet
 
 func init() {
 	for i := 0; i < NumNodes; i++ {
-		// Force IPv4
 		nodeAddresses[i] = fmt.Sprintf("127.0.0.1:%d", NodeBasePort+i)
 	}
 }
 
-// Struct to hold a parsed test set from the 5-column CSV
 type TestSet struct {
 	SetNumber    int
-	Transactions []interface{} // Can hold Transaction or BalanceCheck
+	Transactions []interface{}
 	LiveNodes    []int
-	Byzantine    map[int][]string // map[nodeID] -> attackType
-	Attacks      []string         // Raw attack strings
+	Byzantine    map[int][]string
+	Attacks      []string
 }
 
-// Transaction struct for (s, r, amt)
 type Transaction struct {
 	Sender   string
 	Receiver string
 	Amount   int32
 }
 
-// BalanceCheck struct for (s)
 type BalanceCheck struct {
 	Sender string
 }
 
-// --- Node Process Management ---
 var nodeProcesses = make(map[int]*exec.Cmd)
 
-// startNode launches a node as a child process
 func startNode(id int, attackTypes []string) error {
 	if _, ok := nodeProcesses[id]; ok {
 		log.Printf("[Harness] Node %d is already running.", id)
 		return nil
 	}
 
-	// Use the .exe extension for Windows
 	exeName := "node_app.exe"
 	exePath, err := filepath.Abs(exeName)
 	if err != nil {
@@ -101,7 +92,6 @@ func startNode(id int, attackTypes []string) error {
 	return nil
 }
 
-// stopAllNodes kills all running child node processes
 func stopAllNodes() {
 	log.Println("[Harness] Stopping all node processes...")
 	for id, cmd := range nodeProcesses {
@@ -122,7 +112,6 @@ func main() {
 
 	defer stopAllNodes()
 
-	// --- Load Cryptographic Keys ---
 	log.Println("[Harness] Loading all public keys...")
 	pubKeys, err := crypto.LoadAllPublicKeys(NumNodes)
 	if err != nil {
@@ -130,26 +119,21 @@ func main() {
 	}
 	log.Println("[Harness] Public keys loaded.")
 
-	// --- Initialize Client Orchestrator ---
 	orchestrator := client.NewClientOrchestrator(nodeAddresses, F, pubKeys)
 	defer orchestrator.CloseConnections()
 
-	// --- Parse Test Cases ---
 	testSets, err := parseTestCases(TestCasesCSV)
 	if err != nil {
 		log.Fatalf("Failed to parse test cases from %s: %v", TestCasesCSV, err)
 	}
 
-	// --- Display Available Test Cases ---
 	scanner := bufio.NewScanner(os.Stdin)
 	fmt.Println("\n--- Available Test Cases ---")
-	// make test sets globally available to interactive commands
 	allTestSets = testSets
 	for _, ts := range allTestSets {
 		fmt.Printf("Test Set %d: Live Nodes: %v, Byzantine Nodes: %v\n", ts.SetNumber, ts.LiveNodes, ts.Attacks)
 	}
 
-	// --- Prompt User to Select Test Case ---
 	var selectedSet *TestSet
 	for {
 		fmt.Print("\nEnter the test set number to run (or 'all' to run all): ")
@@ -160,7 +144,6 @@ func main() {
 		input := strings.TrimSpace(scanner.Text())
 
 		if input == "all" {
-			// Run all test sets
 			for _, ts := range testSets {
 				executeTestSet(ts, orchestrator, scanner)
 			}
@@ -174,7 +157,6 @@ func main() {
 			continue
 		}
 
-		// Find the selected test set
 		found := false
 		for i := range testSets {
 			if testSets[i].SetNumber == setNum {
@@ -192,18 +174,13 @@ func main() {
 		break
 	}
 
-	// --- Execute the Selected Test Set ---
 	if selectedSet != nil {
 		executeTestSet(*selectedSet, orchestrator, scanner)
 		log.Println("--- Test set completed. ---")
 	}
 }
 
-// executeTestSet runs a single test set
 func executeTestSet(ts TestSet, orchestrator *client.ClientOrchestrator, scanner *bufio.Scanner) {
-	// The executeTestSet function now supports repeating or running other sets
-	// from the interactive prompt. It will loop until the user issues 'next'
-	// to return to the main selector or 'exit' to quit the program.
 	current := ts
 restart:
 	for {
@@ -213,9 +190,7 @@ restart:
 
 		log.Printf("Executing Test Set %d with live nodes: %v", current.SetNumber, current.LiveNodes)
 
-		// --- 1. Start all "Live" nodes ---
 		for _, nodeID := range current.LiveNodes {
-			// Note: CSV is 1-based, internal is 0-based
 			internalID := nodeID - 1
 			attackList := current.Byzantine[internalID]
 
@@ -227,7 +202,6 @@ restart:
 		log.Println("[Harness] All nodes for this set are starting. Waiting 10 seconds for them to boot...")
 		time.Sleep(10 * time.Second)
 
-		// --- 2. Submit all operations for this set ---
 		fmt.Println("\n--- Submitting operations for this set ---")
 		var wg sync.WaitGroup
 
@@ -235,7 +209,6 @@ restart:
 			wg.Add(1)
 
 			if tx, ok := op.(Transaction); ok {
-				// Read-Write Transfer
 				clientID := fmt.Sprintf("client-%d", i%10)
 				go func(cid, sender, receiver string, amt int32) {
 					defer wg.Done()
@@ -249,7 +222,6 @@ restart:
 				}(clientID, tx.Sender, tx.Receiver, tx.Amount)
 
 			} else if bc, ok := op.(BalanceCheck); ok {
-				// Read-Only Balance
 				clientID := fmt.Sprintf("client-%d", i%10)
 				go func(cid, sender string) {
 					defer wg.Done()
@@ -268,11 +240,9 @@ restart:
 		wg.Wait()
 		log.Println("--- All transactions for this set are complete ---")
 
-		// Flush failed/old connections *before* the prompt
 		log.Println("[Harness] Flushing all client connections...")
 		orchestrator.CloseConnections()
 
-		// --- 3. Interactive Command Prompt ---
 		fmt.Println("\n--- Test Set Complete ---")
 		for {
 			fmt.Print("Enter command (printdb <id>, printlog <id>, printstatus <id> <seq>, printview <id>, run <set>, rerun, next, exit): ")
@@ -288,7 +258,6 @@ restart:
 			}
 
 			command := parts[0]
-			// Support running another test set or re-running the current one
 			if command == "run" {
 				if len(parts) < 2 {
 					log.Println("Usage: run <setNumber>")
@@ -299,15 +268,12 @@ restart:
 					log.Printf("Invalid set number '%s'", parts[1])
 					continue
 				}
-				// Find requested set
 				found := false
 				for _, s := range allTestSets {
 					if s.SetNumber == setNum {
-						// Stop current nodes and switch to requested
 						stopAllNodes()
 						orchestrator.CloseConnections()
 						current = s
-						// restart the outer loop to run the new set
 						goto restart
 					}
 				}
@@ -319,12 +285,10 @@ restart:
 			if command == "rerun" {
 				stopAllNodes()
 				orchestrator.CloseConnections()
-				// restart same set
 				goto restart
 			}
 
 			if command == "next" {
-				// --- 4. FLUSH System State ---
 				stopAllNodes()
 				log.Println("[Harness] System state FLUSHED. Proceeding to next set.")
 				orchestrator.CloseConnections()
@@ -336,7 +300,6 @@ restart:
 				os.Exit(0)
 			}
 
-			// Remaining commands operate on nodes in the current set
 			if len(parts) < 2 {
 				log.Println("Invalid command. Missing node ID.")
 				continue
@@ -353,7 +316,7 @@ restart:
 				continue
 			}
 
-			queryClient, err := orchestrator.GetGrpcClient(nodeID) // This is now exported
+			queryClient, err := orchestrator.GetGrpcClient(nodeID)
 			if err != nil {
 				log.Printf("Error connecting to node %d: %v", nodeID, err)
 				continue
@@ -437,7 +400,6 @@ restart:
 	}
 }
 
-// parseTestCases reads the 5-column CSV file for Project 2
 func parseTestCases(filepath string) ([]TestSet, error) {
 	file, err := os.Open(filepath)
 	if err != nil {
@@ -457,23 +419,20 @@ func parseTestCases(filepath string) ([]TestSet, error) {
 		return nil, fmt.Errorf("empty test case file")
 	}
 
-	// Skip header
 	records = records[1:]
 
 	var testSets []TestSet
 	var currentSet *TestSet = nil
 
-	// Regex for parsing:
 	txRegex := regexp.MustCompile(`\(\s*([^,]+)\s*,\s*([^,]+)\s*,\s*(\d+)\s*\)`) // (Sender, Receiver, Amount)
 	bcRegex := regexp.MustCompile(`\(\s*([^,]+)\s*\)`)                           // (Sender)
 	nodeRegex := regexp.MustCompile(`n(\d+)`)                                    // n1, n2, etc.
 
 	for i, row := range records {
 		if len(row) < 5 {
-			continue // Skip empty/malformed rows
+			continue
 		}
 
-		// 1. Check for new set number
 		if row[0] != "" {
 			setNum, err := strconv.Atoi(row[0])
 			if err != nil {
@@ -492,7 +451,6 @@ func parseTestCases(filepath string) ([]TestSet, error) {
 				Attacks:      make([]string, 0),
 			}
 
-			// 2. Parse Live Nodes
 			matches := nodeRegex.FindAllStringSubmatch(row[2], -1)
 			for _, match := range matches {
 				id, _ := strconv.Atoi(match[1])
@@ -500,7 +458,6 @@ func parseTestCases(filepath string) ([]TestSet, error) {
 			}
 			sort.Ints(currentSet.LiveNodes)
 
-			// 3. Parse Byzantine Nodes
 			byzantineNodes := make([]int, 0)
 			matches = nodeRegex.FindAllStringSubmatch(row[3], -1)
 			for _, match := range matches {
@@ -508,13 +465,11 @@ func parseTestCases(filepath string) ([]TestSet, error) {
 				byzantineNodes = append(byzantineNodes, id-1) // 1-based ID
 			}
 
-			// 4. Parse Attacks and map to Byzantine nodes (NEW LOGIC)
 			attackStr := strings.Trim(row[4], "[]")
 			if attackStr != "" {
 				attacks := strings.Split(attackStr, ";")
 				currentSet.Attacks = attacks
 
-				// Find the primary for this view (assume view 0, so node 0)
 				primaryID := 0 // n1 is 0-based ID 0
 
 				for _, attack := range attacks {
@@ -523,13 +478,9 @@ func parseTestCases(filepath string) ([]TestSet, error) {
 						continue
 					}
 
-					// Leader-specific attacks
 					if attack == "time" || strings.HasPrefix(attack, "equivocation") {
-						// Assign this attack to the primary (Node 0)
-						// This assumes n1 is always the primary in attack specs
 						currentSet.Byzantine[primaryID] = append(currentSet.Byzantine[primaryID], attack)
 					} else {
-						// General attacks (crash, sign, dark) apply to ALL listed byzantine nodes
 						for _, byzNodeID := range byzantineNodes {
 							currentSet.Byzantine[byzNodeID] = append(currentSet.Byzantine[byzNodeID], attack)
 						}
@@ -542,14 +493,12 @@ func parseTestCases(filepath string) ([]TestSet, error) {
 			return nil, fmt.Errorf("transaction found before any set number on row %d", i+2)
 		}
 
-		// 5. Parse transaction/operation
 		opStr := strings.Trim(row[1], `" `)
 		if opStr == "" {
 			continue
 		}
 
 		if matches := txRegex.FindStringSubmatch(opStr); len(matches) == 4 {
-			// It's a Read-Write Transfer
 			amount, _ := strconv.Atoi(matches[3])
 			tx := Transaction{
 				Sender:   strings.TrimSpace(matches[1]),
@@ -558,13 +507,11 @@ func parseTestCases(filepath string) ([]TestSet, error) {
 			}
 			currentSet.Transactions = append(currentSet.Transactions, tx)
 		} else if matches := bcRegex.FindStringSubmatch(opStr); len(matches) == 2 {
-			// It's a Read-Only Balance Check
 			bc := BalanceCheck{
 				Sender: strings.TrimSpace(matches[1]),
 			}
 			currentSet.Transactions = append(currentSet.Transactions, bc)
 		} else {
-			// This warning will no longer fire for valid transactions
 			log.Printf("Warning: malformed transaction on row %d: %s", i+2, opStr)
 		}
 	}

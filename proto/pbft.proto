@@ -1,8 +1,8 @@
 syntax = "proto3";
 
-package proto; // Use a simple package name
+package proto; 
 
-option go_package = "./proto"; // Go package path
+option go_package = "./proto"; 
 
 // --------------------
 // Core Data Structures

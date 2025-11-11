@@ -1,10 +1,9 @@
-// Create this file at: cmd/keygen/main.go
 package main
 
 import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
-	"crypto/rand" // <-- THE MISSING IMPORT
+	"crypto/rand"
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
@@ -20,7 +19,6 @@ func main() {
 
 	for i := 0; i < NumNodes; i++ {
 		// 1. Generate a new private key
-		// *** THIS IS THE FIX: Use rand.Reader instead of nil ***
 		privKey, err := ecdsa.GenerateKey(curve, rand.Reader)
 		if err != nil {
 			log.Fatalf("Failed to generate private key for node %d: %v", i, err)
