@@ -18,6 +18,19 @@ import (
 	pb "bft-DarkBrewww/proto"
 )
 
+const (
+	// RequestTimeout is how long a client keeps retransmitting a read-write request
+	// before giving up. It has to cover a view change whose first new primary is
+	// also faulty (request timer + view-change timer on the replicas).
+	RequestTimeout = 30 * time.Second
+	// AttemptTimeout is how long one transmission to a replica waits for its reply.
+	AttemptTimeout = 10 * time.Second
+	// RetryBackoff is the pause before retransmitting to a replica.
+	RetryBackoff = 500 * time.Millisecond
+	// ReadOnlyTimeout bounds the read-only fast path before falling back to consensus.
+	ReadOnlyTimeout = 3 * time.Second
+)
+
 type ClientOrchestrator struct {
 	nodeAddrs map[int]string
 
@@ -76,12 +89,11 @@ func (c *ClientOrchestrator) GetGrpcClient(peerID int) (pb.PbftNodeClient, error
 		return nil, fmt.Errorf("unknown peer ID %d", peerID)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-	defer cancel()
-
-	conn, err := grpc.DialContext(ctx, peerAddr,
+	// Non-blocking dial: the connection is set up in the background. A blocking dial
+	// here held c.mu for a full second per offline node, which serialized every
+	// request behind it and delivered requests to live nodes seconds late.
+	conn, err := grpc.Dial(peerAddr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithBlock(),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to peer %d at %s: %w", peerID, peerAddr, err)
@@ -127,7 +139,7 @@ func (c *ClientOrchestrator) SubmitTransfer(clientID, sender, receiver string, a
 	}
 
 	log.Printf("[%s] Submitting Transfer (ts=%d): (%s, %s, %d)", clientID, ts, sender, receiver, amount)
-	return c.submitRequestInternal(req, c.replyQuorum)
+	return c.submitRequestInternal(req, c.replyQuorum, RequestTimeout, true)
 }
 
 func (c *ClientOrchestrator) SubmitBalance(clientID, sender string) (string, error) {
@@ -151,7 +163,8 @@ func (c *ClientOrchestrator) SubmitBalance(clientID, sender string) (string, err
 
 	log.Printf("[%s] Submitting Balance Check (ts=%d): (%s)", clientID, ts, sender)
 
-	result, err := c.submitRequestInternal(readOnlyReq, c.readQuorum)
+	// Read-only fast path: one round, 2f+1 matching replies, no retransmission.
+	result, err := c.submitRequestInternal(readOnlyReq, c.readQuorum, ReadOnlyTimeout, false)
 
 	if err != nil && (strings.Contains(err.Error(), "client timeout") || strings.Contains(err.Error(), "no quorum")) {
 		log.Printf("[%s] Read-only path for (ts=%d) failed. Falling back to full consensus.", clientID, ts)
@@ -161,28 +174,40 @@ func (c *ClientOrchestrator) SubmitBalance(clientID, sender string) (string, err
 		fallbackTs := clientState.Timestamp
 		c.mu.Unlock()
 
+		// Sent as a zero-amount self-transfer so the replicas order it through
+		// consensus instead of answering it on the read-only path again; it executes
+		// as a balance read (see isConsensusRead in node.go).
 		fallbackReq := &pb.ClientRequest{
-			Transaction: readOnlyReq.Transaction,
-			Timestamp:   fallbackTs,
-			ClientId:    clientID,
+			Transaction: &pb.Transaction{
+				Sender:   sender,
+				Receiver: sender,
+				Amount:   0,
+			},
+			Timestamp: fallbackTs,
+			ClientId:  clientID,
 		}
 
-		log.Printf("[%s] Submitting Fallback Transfer (ts=%d) for balance check", clientID, fallbackTs)
-		return c.submitRequestInternal(fallbackReq, c.replyQuorum)
+		log.Printf("[%s] Submitting Fallback consensus read (ts=%d) for balance check", clientID, fallbackTs)
+		return c.submitRequestInternal(fallbackReq, c.replyQuorum, RequestTimeout, true)
 	}
 
 	return result, err
 }
 
-func (c *ClientOrchestrator) submitRequestInternal(req *pb.ClientRequest, quorumSize int) (string, error) {
+// submitRequestInternal sends req to every replica and returns once quorumSize
+// replicas sent valid, signed, matching results. With retransmit set, the request
+// is re-sent to each replica until it answers or the timeout expires, so it
+// survives view changes (PBFT clients retransmit until they get f+1 replies).
+func (c *ClientOrchestrator) submitRequestInternal(req *pb.ClientRequest, quorumSize int, timeout time.Duration, retransmit bool) (string, error) {
 	ts := req.Timestamp
 	clientID := req.ClientId
 
-	mainCtx, mainCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	mainCtx, mainCancel := context.WithTimeout(context.Background(), timeout)
 	defer mainCancel()
 
 	replyChan := make(chan *pb.ClientReply, len(c.nodeAddrs))
 	replyCounts := make(map[string]int)
+	replied := make(map[int32]bool)
 	var wg sync.WaitGroup
 	wg.Add(len(c.nodeAddrs))
 
@@ -190,21 +215,40 @@ func (c *ClientOrchestrator) submitRequestInternal(req *pb.ClientRequest, quorum
 		go func(pID int) {
 			defer wg.Done()
 
-			client, err := c.GetGrpcClient(pID)
-			if err != nil {
-				log.Printf("[%s] DEBUG: Failed to get client for Node %d: %v", clientID, pID, err)
-				return
+			for attempt := 1; ; attempt++ {
+				client, err := c.GetGrpcClient(pID)
+				if err != nil {
+					log.Printf("[%s] DEBUG: Failed to get client for Node %d: %v", clientID, pID, err)
+				} else {
+					attemptCtx, attemptCancel := context.WithTimeout(mainCtx, AttemptTimeout)
+					res, err := client.SubmitRequest(attemptCtx, req)
+					attemptCancel()
+
+					switch {
+					case err != nil:
+						if attempt == 1 {
+							log.Printf("[%s] DEBUG: Error from Node %d: %v", clientID, pID, err)
+						}
+					case res.Signature != nil && res.Timestamp == ts && res.ClientId == clientID:
+						select {
+						case replyChan <- res:
+						case <-mainCtx.Done():
+						}
+						return
+					default:
+						log.Printf("[%s] DEBUG: No reply yet from Node %d for (ts=%d): %s. Retransmitting.", clientID, pID, ts, res.Result)
+					}
+				}
+
+				if !retransmit {
+					return
+				}
+				select {
+				case <-mainCtx.Done():
+					return
+				case <-time.After(RetryBackoff):
+				}
 			}
-
-			res, err := client.SubmitRequest(mainCtx, req)
-
-			if err != nil {
-				log.Printf("[%s] DEBUG: Error from Node %d: %v", clientID, pID, err)
-				return
-			}
-
-			replyChan <- res
-
 		}(peerID)
 	}
 
@@ -230,6 +274,9 @@ func (c *ClientOrchestrator) submitRequestInternal(req *pb.ClientRequest, quorum
 				log.Printf("[%s] Ignoring stale reply (ts=%d) from Node %d", clientID, res.Timestamp, res.ReplicaId)
 				continue
 			}
+			if replied[res.ReplicaId] {
+				continue // count each replica once
+			}
 
 			replyData, err := clientReplyDataForSig(res.View, res.Timestamp, res.ClientId, res.ReplicaId, res.Result)
 			if err != nil {
@@ -240,10 +287,13 @@ func (c *ClientOrchestrator) submitRequestInternal(req *pb.ClientRequest, quorum
 				log.Printf("[%s] INVALID SIGNATURE from Node %d! (Byzantine). Ignoring.", clientID, res.ReplicaId)
 				continue
 			}
+			replied[res.ReplicaId] = true
 
-			resultKey := fmt.Sprintf("V:%d-R:%s", res.View, res.Result)
+			// Match on the result only: replicas that executed the request after a view
+			// change report a different view for the same result.
+			resultKey := res.Result
 			replyCounts[resultKey]++
-			log.Printf("[%s] Got valid reply for (ts=%d) from Node %d. Result: '%s'. Count for this result: %d", clientID, ts, res.ReplicaId, resultKey, replyCounts[resultKey])
+			log.Printf("[%s] Got valid reply for (ts=%d) from Node %d (view %d). Result: '%s'. Count for this result: %d", clientID, ts, res.ReplicaId, res.View, resultKey, replyCounts[resultKey])
 
 			if replyCounts[resultKey] == quorumSize {
 				log.Printf("[%s] QUORUM MET for (ts=%d). Final result: '%s'", clientID, ts, res.Result)

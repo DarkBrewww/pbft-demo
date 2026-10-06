@@ -322,7 +322,6 @@ restart:
 				continue
 			}
 			ctxQuery, cancelQuery := context.WithTimeout(context.Background(), 2*time.Second)
-			defer cancelQuery()
 
 			switch command {
 			case "printdb":
@@ -356,11 +355,13 @@ restart:
 			case "printstatus":
 				if len(parts) < 3 {
 					log.Println("Usage: printstatus <id> <seq>")
+					cancelQuery()
 					continue
 				}
 				seq, err := strconv.ParseInt(parts[2], 10, 64)
 				if err != nil {
 					log.Printf("Invalid sequence number '%s'", parts[2])
+					cancelQuery()
 					continue
 				}
 				res, err := queryClient.GetNodeState(ctxQuery, &pb.StateRequest{SequenceNumber: seq})
@@ -396,6 +397,7 @@ restart:
 			default:
 				log.Printf("Unknown command '%s'", command)
 			}
+			cancelQuery()
 		}
 	}
 }

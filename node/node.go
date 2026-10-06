@@ -37,6 +37,21 @@ const (
 	CheckpointInterval = int64(10)
 
 	WatermarkRange = int64(20)
+
+	// MaxInFlight caps how far past its own last executed sequence number the
+	// primary may assign sequence numbers. It is half the watermark window so a
+	// backup that lags a little behind the primary still accepts the PrePrepare.
+	MaxInFlight = WatermarkRange / 2
+
+	// TimingAttackDelay is how long a primary running the "time" attack holds each request.
+	TimingAttackDelay = 500 * time.Millisecond
+
+	// MaxClientWait bounds how long a SubmitRequest handler waits for execution
+	// if the client did not set a deadline.
+	MaxClientWait = 60 * time.Second
+
+	// NoOpClientID marks the no-op requests a new primary proposes for gaps.
+	NoOpClientID = "no-op"
 )
 
 const (
@@ -59,6 +74,24 @@ type InternalLogEntry struct {
 	CommitVotes   map[int]*pb.CommitRequest
 	FullPrepareRx bool
 	FullCommitRx  bool
+
+	// PreparedCert is the prepare certificate (PrePrepare + 2f Prepares) from the
+	// highest view in which this entry prepared at this replica. It survives
+	// re-proposals in later views so a view change always reports it (PBFT P-set).
+	PreparedCert *pb.PProof
+}
+
+// pendingRequest is a client request this replica received but has not executed yet.
+type pendingRequest struct {
+	req     *pb.ClientRequest
+	arrival int64
+}
+
+// execRecord remembers how a client request was executed, so retransmissions and
+// late-arriving copies get the same reply and are never applied twice.
+type execRecord struct {
+	result string
+	view   int32
 }
 
 type Node struct {
@@ -91,9 +124,17 @@ type Node struct {
 	grpcClients map[int]pb.PbftNodeClient
 	clientConn  map[int]*grpc.ClientConn
 
-	pendingClientReplies map[string]chan *pb.ClientReply
+	// Client request bookkeeping (keyed by "<clientId>-<timestamp>")
+	pendingRequests map[string]*pendingRequest
+	arrivals        int64
+	proposedInView  map[string]int32         // requests this node proposed as primary, and in which view
+	executedReqs    map[string]execRecord    // executed requests and their results
+	execWaiters     map[string]chan struct{} // closed when the request executes
 
-	viewChangeVotes map[int32]map[int]*pb.ViewChangeRequest
+	viewChangeVotes   map[int32]map[int]*pb.ViewChangeRequest
+	viewChangeHistory []*pb.ViewChangeRequest // every valid VIEW-CHANGE seen, for printview
+	newViewSent       map[int32]bool
+	vcAttempts        int // consecutive view changes that timed out (timeout doubles)
 
 	requestTimers map[int64]*time.Timer
 	viewTimer     *time.Timer
@@ -163,29 +204,33 @@ func NewNode(id int, addrs map[int]string, f int, privKey *ecdsa.PrivateKey, pub
 	}
 
 	node := &Node{
-		ID:                   id,
-		NodeAddrs:            addrs,
-		F:                    f,
-		N:                    n,
-		QuorumSize:           2*f + 1,
-		ClientQuorum:         f + 1,
-		AttackModes:          attackModes,
-		darkTargets:          darkTargets,
-		equivocationTargets:  equivocationTargets,
-		State:                StateNormal,
-		View:                 0,
-		SeqNum:               0,
-		LastExecuted:         0,
-		Watermarks:           struct{ Low, High int64 }{0, WatermarkRange},
-		MessageLog:           make(map[int64]*InternalLogEntry),
-		DB:                   make(map[string]int32),
-		PrivateKey:           privKey,
-		PublicKeys:           pubKeys,
-		grpcClients:          make(map[int]pb.PbftNodeClient),
-		clientConn:           make(map[int]*grpc.ClientConn),
-		pendingClientReplies: make(map[string]chan *pb.ClientReply),
-		requestTimers:        make(map[int64]*time.Timer),
-		viewChangeVotes:      make(map[int32]map[int]*pb.ViewChangeRequest),
+		ID:                  id,
+		NodeAddrs:           addrs,
+		F:                   f,
+		N:                   n,
+		QuorumSize:          2*f + 1,
+		ClientQuorum:        f + 1,
+		AttackModes:         attackModes,
+		darkTargets:         darkTargets,
+		equivocationTargets: equivocationTargets,
+		State:               StateNormal,
+		View:                0,
+		SeqNum:              0,
+		LastExecuted:        0,
+		Watermarks:          struct{ Low, High int64 }{0, WatermarkRange},
+		MessageLog:          make(map[int64]*InternalLogEntry),
+		DB:                  make(map[string]int32),
+		PrivateKey:          privKey,
+		PublicKeys:          pubKeys,
+		grpcClients:         make(map[int]pb.PbftNodeClient),
+		clientConn:          make(map[int]*grpc.ClientConn),
+		pendingRequests:     make(map[string]*pendingRequest),
+		proposedInView:      make(map[string]int32),
+		executedReqs:        make(map[string]execRecord),
+		execWaiters:         make(map[string]chan struct{}),
+		requestTimers:       make(map[int64]*time.Timer),
+		viewChangeVotes:     make(map[int32]map[int]*pb.ViewChangeRequest),
+		newViewSent:         make(map[int32]bool),
 		//stableCheckpoints:    make(map[int64]*pb.CheckpointProof),
 		//checkpointVotes:      make(map[int64]map[int]*pb.Checkpoint),
 		//lastStableCheckpoint: 0,
@@ -370,18 +415,54 @@ func (n *Node) getPrimaryID(view int32) int {
 	return int(view) % n.N
 }
 
+func requestKey(req *pb.ClientRequest) string {
+	return fmt.Sprintf("%s-%d", req.ClientId, req.Timestamp)
+}
+
+// isReadOnly reports a balance query that each replica answers directly (no consensus).
+func isReadOnly(tx *pb.Transaction) bool {
+	return tx != nil && tx.Receiver == "" && tx.Amount == 0
+}
+
+// isConsensusRead reports a balance query the client re-sent through consensus
+// after the read-only fast path failed. It is encoded as a zero-amount self-transfer.
+func isConsensusRead(tx *pb.Transaction) bool {
+	return tx != nil && tx.Sender != "" && tx.Receiver == tx.Sender && tx.Amount == 0
+}
+
+func newLogEntry(pp *pb.PrePrepareRequest) *InternalLogEntry {
+	return &InternalLogEntry{
+		SequenceNumber: pp.SequenceNumber,
+		View:           pp.View,
+		Digest:         pp.Digest.Hash,
+		Request:        pp.Request,
+		Status:         StatusPrePrepared,
+		PrePrepareMsg:  pp,
+		PrepareVotes:   make(map[int]*pb.PrepareRequest),
+		CommitVotes:    make(map[int]*pb.CommitRequest),
+	}
+}
+
 func (n *Node) SubmitRequest(ctx context.Context, req *pb.ClientRequest) (*pb.ClientReply, error) {
 	tx := req.Transaction
-	if tx != nil && tx.Receiver == "" && tx.Amount == 0 {
+	if tx == nil {
+		return &pb.ClientReply{Result: "failed: missing transaction"}, nil
+	}
+
+	// --- Read-Only Path ---
+	if isReadOnly(tx) {
+		if n.AttackModes["crash"] {
+			log.Printf("Node %d [ATTACK]: Crashing. *NOT* answering read-only request from %s (ts=%d).", n.ID, req.ClientId, req.Timestamp)
+			return n.withholdReply(ctx), nil
+		}
+
 		n.mu.Lock()
 		log.Printf("Node %d received Read-Only request from %s (ts=%d). Executing immediately.", n.ID, req.ClientId, req.Timestamp)
 
-		result := ""
+		// Reads never write: an unknown account just reports the initial balance.
+		result := "Balance: 10"
 		if val, ok := n.DB[tx.Sender]; ok {
 			result = fmt.Sprintf("Balance: %d", val)
-		} else {
-			n.DB[tx.Sender] = 10
-			result = "Balance: 10"
 		}
 
 		view := n.View
@@ -412,188 +493,205 @@ func (n *Node) SubmitRequest(ctx context.Context, req *pb.ClientRequest) (*pb.Cl
 	// --- End Read-Only Path ---
 
 	// --- Normal Read-Write Path ---
+	reqKey := requestKey(req)
 	n.mu.Lock()
-	log.Printf("Node %d received Read-Write request from client %s (ts=%d)", n.ID, req.ClientId, req.Timestamp)
 
-	isPrimary := n.getPrimaryID(n.View) == n.ID
-	currentView := n.View
-
-	// Key for this specific client request
-	reqKey := fmt.Sprintf("%s-%d", req.ClientId, req.Timestamp)
-
-	// Check if this request is already being processed
-	replyChan, ok := n.pendingClientReplies[reqKey]
-	if !ok {
-		// --- This is a new request ---
-		replyChan = make(chan *pb.ClientReply, 1)
-		n.pendingClientReplies[reqKey] = replyChan
-
-		if isPrimary {
-			// --- Primary Logic ---
-
-			// --- Attack Logic: Timing ---
-			if n.AttackModes["time"] {
-				log.Printf("Node %d (Primary) [ATTACK]: Timing attack. Delaying for 500ms...", n.ID)
-				n.mu.Unlock() // Unlock while sleeping
-				time.Sleep(500 * time.Millisecond)
-				n.mu.Lock() // Re-lock
-			}
-			// --- End Attack Logic ---
-
-			n.SeqNum++
-			seqNum := n.SeqNum
-
-			d, err := digest(req)
-			if err != nil {
-				n.mu.Unlock()
-				log.Printf("Node %d (Primary): Failed to calculate digest: %v", n.ID, err)
-				return &pb.ClientReply{Result: "failed: internal error"}, nil
-			}
-			digestProto := &pb.Digest{Hash: d}
-
-			// --- Attack Logic: Equivocation ---
-			if n.AttackModes["equivocation"] {
-				log.Printf("Node %d (Primary) [ATTACK]: Executing Equivocation for seq %d", n.ID, seqNum)
-
-				// Log the "official" request as seqNum
-				n.MessageLog[seqNum] = &InternalLogEntry{
-					SequenceNumber: seqNum,
-					View:           currentView,
-					Digest:         d,
-					Request:        req,
-					Status:         StatusPrePrepared, // Tentative
-					PrepareVotes:   make(map[int]*pb.PrepareRequest),
-					CommitVotes:    make(map[int]*pb.CommitRequest),
-				}
-
-				// Burn the next sequence number
-				n.SeqNum++
-				equivSeqNum := n.SeqNum
-
-				// Log the *conflicting* request
-				n.MessageLog[equivSeqNum] = &InternalLogEntry{
-					SequenceNumber: equivSeqNum,
-					View:           currentView,
-					Digest:         d,
-					Request:        req, // Same request, different seq
-					Status:         StatusPrePrepared,
-					PrepareVotes:   make(map[int]*pb.PrepareRequest),
-					CommitVotes:    make(map[int]*pb.CommitRequest),
-				}
-
-				// Create PrePrepare for (seq, req)
-				prePrepareMsg1, _ := n.createSignedPrePrepare(currentView, seqNum, d, req)
-				// Create PrePrepare for (seq+1, req)
-				prePrepareMsg2, _ := n.createSignedPrePrepare(currentView, equivSeqNum, d, req)
-				n.logPrePrepare(prePrepareMsg1)
-				n.logPrePrepare(prePrepareMsg2)
-
-				n.mu.Unlock() // Unlock before broadcasting
-
-				// Send conflicting messages
-				log.Printf("Node %d [ATTACK]: Sending conflicting messages to targets %v", n.ID, n.equivocationTargets)
-				for peerID := range n.NodeAddrs {
-					if peerID == n.ID {
-						continue
-					}
-
-					var msgToSend *pb.PrePrepareRequest
-
-					// It checks if the peerID is in the map we created.
-					if n.equivocationTargets[peerID] {
-						// peerID is in the equivocation target set: Send the conflicting message
-						msgToSend = prePrepareMsg2
-					} else {
-						// peerID is not targeted for equivocation: Send the normal message
-						msgToSend = prePrepareMsg1
-					}
-
-					go n.sendToPeer(peerID, msgToSend, "PrePrepare")
-				}
-				log.Printf("Node %d [ATTACK]: Sent seq %d to even nodes and seq %d to odd nodes", n.ID, seqNum, equivSeqNum)
-
-			} else {
-				// --- Normal Primary Logic ---
-				prePrepareCoreData, err := prePrepareDataForSig(currentView, seqNum, d)
-				if err != nil {
-					n.mu.Unlock()
-					log.Printf("Node %d (Primary): Failed to serialize PrePrepare for signing: %v", n.ID, err)
-					return &pb.ClientReply{Result: "failed: internal error"}, nil
-				}
-				signature, err := n.sign(prePrepareCoreData)
-				if err != nil {
-					n.mu.Unlock()
-					log.Printf("Node %d (Primary): Failed to sign PrePrepare: %v", n.ID, err)
-					return &pb.ClientReply{Result: "failed: internal error"}, nil
-				}
-
-				prePrepareMsg := &pb.PrePrepareRequest{
-					View:           currentView,
-					SequenceNumber: seqNum,
-					Digest:         digestProto,
-					Request:        req,
-					Signature:      signature,
-				}
-
-				n.MessageLog[seqNum] = &InternalLogEntry{
-					SequenceNumber: seqNum,
-					View:           currentView,
-					Digest:         d,
-					Request:        req,
-					Status:         StatusPrePrepared,
-					PrePrepareMsg:  prePrepareMsg,
-					PrepareVotes:   make(map[int]*pb.PrepareRequest),
-					CommitVotes:    make(map[int]*pb.CommitRequest),
-				}
-				log.Printf("Node %d (Primary) assigned seq=%d to request %s", n.ID, seqNum, reqKey)
-
-				n.mu.Unlock()
-
-				// Broadcast PrePrepare to all backups
-				for peerID := range n.NodeAddrs {
-					if peerID == n.ID {
-						continue
-					}
-					// Use the generic send helper which checks for In-dark
-					go n.sendToPeer(peerID, prePrepareMsg, "PrePrepare")
-				}
-			} // --- End Attack/Normal Logic ---
-
-		} else {
-			// --- Backup Logic ---
-			// NO FORWARDING. Just log and wait for consensus.
-			log.Printf("Node %d (Backup) received %s. Awaiting consensus.", n.ID, reqKey)
-			n.mu.Unlock()
-		}
-	} else {
-		// --- This is a re-transmitted request ---
-		log.Printf("Node %d received duplicate SubmitRequest for %s. Waiting on existing channel.", n.ID, reqKey)
+	// Already executed (late copy or client retransmission): answer from the record.
+	if rec, ok := n.executedReqs[reqKey]; ok {
 		n.mu.Unlock()
+		log.Printf("Node %d: %s was already executed. Re-sending the reply.", n.ID, reqKey)
+		return n.clientReply(ctx, req, rec)
 	}
 
-	// --- Wait for Reply ---
-	// Both Primary and Backup goroutines will wait here.
+	if _, ok := n.pendingRequests[reqKey]; ok {
+		log.Printf("Node %d received duplicate SubmitRequest for %s. Waiting for execution.", n.ID, reqKey)
+	} else {
+		log.Printf("Node %d received Read-Write request from client %s (ts=%d)", n.ID, req.ClientId, req.Timestamp)
+		n.arrivals++
+		n.pendingRequests[reqKey] = &pendingRequest{req: req, arrival: n.arrivals}
+	}
+	done, ok := n.execWaiters[reqKey]
+	if !ok {
+		done = make(chan struct{})
+		n.execWaiters[reqKey] = done
+	}
+
+	if n.getPrimaryID(n.View) == n.ID && n.State == StateNormal {
+		// --- Attack Logic: Timing ---
+		if n.AttackModes["time"] {
+			log.Printf("Node %d (Primary) [ATTACK]: Timing attack. Delaying %s for %v...", n.ID, reqKey, TimingAttackDelay)
+			n.mu.Unlock() // Unlock while sleeping
+			time.Sleep(TimingAttackDelay)
+			n.mu.Lock() // Re-lock
+		}
+		// --- End Attack Logic ---
+		n.proposePending()
+	} else {
+		// --- Backup Logic ---
+		// NO FORWARDING. The client broadcasts to every replica; wait for consensus.
+		// If a view change makes this node primary, it proposes the request then.
+		log.Printf("Node %d (Backup) received %s. Awaiting consensus.", n.ID, reqKey)
+	}
+	n.mu.Unlock()
+
+	// --- Wait for Execution ---
+	waitCtx, cancel := context.WithTimeout(ctx, MaxClientWait)
+	defer cancel()
 	select {
-	case reply := <-replyChan:
-		log.Printf("Node %d sending final reply for %s: %s", n.ID, reqKey, reply.Result)
+	case <-done:
 		n.mu.Lock()
-		delete(n.pendingClientReplies, reqKey)
+		rec := n.executedReqs[reqKey]
 		n.mu.Unlock()
-		return reply, nil
+		return n.clientReply(ctx, req, rec)
 
-	case <-ctx.Done(): // Client cancelled or timed out
-		log.Printf("Node %d: Client request context done for %s", n.ID, reqKey)
-		n.mu.Lock()
-		delete(n.pendingClientReplies, reqKey)
-		n.mu.Unlock()
+	case <-waitCtx.Done(): // Client cancelled, timed out, or will retransmit
+		log.Printf("Node %d: Client request context done for %s before execution", n.ID, reqKey)
 		return &pb.ClientReply{Result: "failed: client timeout"}, nil
+	}
+}
 
-	case <-time.After(10 * time.Second): // Our own internal timeout
-		log.Printf("Node %d: Internal timeout for %s", n.ID, reqKey)
-		n.mu.Lock()
-		delete(n.pendingClientReplies, reqKey)
-		n.mu.Unlock()
-		return &pb.ClientReply{Result: "failed: node timeout"}, nil
+// clientReply signs the reply for an executed request.
+// Implements the "Crash" attack for replies.
+func (n *Node) clientReply(ctx context.Context, req *pb.ClientRequest, rec execRecord) (*pb.ClientReply, error) {
+	reqKey := requestKey(req)
+
+	// --- Attack Logic: Crash (Reply) ---
+	// PDF: "does not send reply messages back to clients"
+	if n.AttackModes["crash"] {
+		log.Printf("Node %d [ATTACK]: Crashing. *NOT* sending reply for %s to client.", n.ID, reqKey)
+		return n.withholdReply(ctx), nil
+	}
+
+	replyCoreData, err := clientReplyDataForSig(rec.view, req.Timestamp, req.ClientId, int32(n.ID), rec.result)
+	if err != nil {
+		log.Printf("Node %d: Failed to serialize reply for signing: %v", n.ID, err)
+		return &pb.ClientReply{Result: "failed: internal error"}, nil
+	}
+	signature, err := n.sign(replyCoreData)
+	if err != nil {
+		log.Printf("Node %d: Failed to sign reply for %s: %v", n.ID, reqKey, err)
+		return &pb.ClientReply{Result: "failed: internal error"}, nil
+	}
+
+	log.Printf("Node %d sending final reply for %s: %s", n.ID, reqKey, rec.result)
+	return &pb.ClientReply{
+		View:      rec.view,
+		Timestamp: req.Timestamp,
+		ClientId:  req.ClientId,
+		ReplicaId: int32(n.ID),
+		Result:    rec.result,
+		Signature: signature,
+	}, nil
+}
+
+// withholdReply blocks until the client gives up; a crashed replica never answers.
+func (n *Node) withholdReply(ctx context.Context) *pb.ClientReply {
+	select {
+	case <-ctx.Done():
+	case <-time.After(MaxClientWait):
+	}
+	return &pb.ClientReply{Result: "failed: no reply"}
+}
+
+// proposePending assigns sequence numbers to the client requests this primary has
+// received but not yet proposed in the current view, oldest first, while they fit
+// in the watermark window. Requests that do not fit are proposed by attemptExecution
+// as the window slides.
+// MUST be called with the lock held.
+func (n *Node) proposePending() {
+	if n.getPrimaryID(n.View) != n.ID || n.State != StateNormal {
+		return
+	}
+
+	queue := make([]*pendingRequest, 0, len(n.pendingRequests))
+	for key, p := range n.pendingRequests {
+		if v, ok := n.proposedInView[key]; ok && v == n.View {
+			continue
+		}
+		queue = append(queue, p)
+	}
+	sort.Slice(queue, func(i, j int) bool { return queue[i].arrival < queue[j].arrival })
+
+	seqsPerRequest := int64(1)
+	if n.AttackModes["equivocation"] {
+		seqsPerRequest = 2
+	}
+	for i, p := range queue {
+		if n.SeqNum+seqsPerRequest > n.LastExecuted+MaxInFlight {
+			log.Printf("Node %d (Primary): %d request(s) waiting for the watermark window (lastExec=%d, seq=%d)", n.ID, len(queue)-i, n.LastExecuted, n.SeqNum)
+			return
+		}
+		n.propose(p.req)
+	}
+}
+
+// propose assigns the next sequence number to req and broadcasts the PrePrepare.
+// Implements the "Equivocation" attack.
+// MUST be called with the lock held.
+func (n *Node) propose(req *pb.ClientRequest) {
+	reqKey := requestKey(req)
+	currentView := n.View
+
+	d, err := digest(req)
+	if err != nil {
+		log.Printf("Node %d (Primary): Failed to calculate digest: %v", n.ID, err)
+		return
+	}
+	n.proposedInView[reqKey] = currentView
+
+	n.SeqNum++
+	seqNum := n.SeqNum
+
+	// --- Attack Logic: Equivocation ---
+	if n.AttackModes["equivocation"] {
+		log.Printf("Node %d (Primary) [ATTACK]: Executing Equivocation for seq %d", n.ID, seqNum)
+
+		// Burn the next sequence number for the conflicting copy
+		n.SeqNum++
+		equivSeqNum := n.SeqNum
+
+		// PrePrepare for (seq, req) and the conflicting one for (seq+1, req)
+		prePrepareMsg1, err1 := n.createSignedPrePrepare(currentView, seqNum, d, req)
+		prePrepareMsg2, err2 := n.createSignedPrePrepare(currentView, equivSeqNum, d, req)
+		if err1 != nil || err2 != nil {
+			log.Printf("Node %d (Primary): Failed to sign PrePrepares: %v %v", n.ID, err1, err2)
+			return
+		}
+		n.logPrePrepare(prePrepareMsg1)
+		n.logPrePrepare(prePrepareMsg2)
+
+		log.Printf("Node %d [ATTACK]: Sending conflicting messages to targets %v", n.ID, n.equivocationTargets)
+		for peerID := range n.NodeAddrs {
+			if peerID == n.ID {
+				continue
+			}
+			msgToSend := prePrepareMsg1
+			if n.equivocationTargets[peerID] {
+				// peerID is in the equivocation target set: send the conflicting message
+				msgToSend = prePrepareMsg2
+			}
+			go n.sendToPeer(peerID, msgToSend, "PrePrepare")
+		}
+		log.Printf("Node %d [ATTACK]: Sent seq %d to targets %v and seq %d to everyone else", n.ID, equivSeqNum, n.equivocationTargets, seqNum)
+		return
+	}
+	// --- End Attack Logic ---
+
+	prePrepareMsg, err := n.createSignedPrePrepare(currentView, seqNum, d, req)
+	if err != nil {
+		log.Printf("Node %d (Primary): Failed to sign PrePrepare: %v", n.ID, err)
+		return
+	}
+	n.logPrePrepare(prePrepareMsg)
+	log.Printf("Node %d (Primary) assigned seq=%d to request %s", n.ID, seqNum, reqKey)
+
+	// Broadcast PrePrepare to all backups
+	for peerID := range n.NodeAddrs {
+		if peerID == n.ID {
+			continue
+		}
+		// Use the generic send helper which checks for In-dark
+		go n.sendToPeer(peerID, prePrepareMsg, "PrePrepare")
 	}
 }
 
@@ -659,130 +757,123 @@ func (n *Node) sendToPeer(peerID int, msg interface{}, msgType string) {
 	}
 }
 
+// startRequestTimer (re)starts the backup's timer for seq. If the request has not
+// executed when it fires, the backup suspects the primary and starts a view change.
+// MUST be called with the lock held.
+func (n *Node) startRequestTimer(seq int64, view int32) {
+	if timer, ok := n.requestTimers[seq]; ok {
+		timer.Stop()
+	}
+	n.requestTimers[seq] = time.AfterFunc(RequestTimeout, func() {
+		n.handleRequestTimeout(seq, view)
+	})
+}
+
 func (n *Node) SendPrePrepare(ctx context.Context, req *pb.PrePrepareRequest) (*pb.Ack, error) {
-
-	if n.AttackModes["crash"] {
-		log.Printf("Node %d (Backup) [ATTACK]: Crashing. Received PrePrepare for seq %d but will not send Prepare.", n.ID, req.SequenceNumber)
-		n.mu.Lock()
-		defer n.mu.Unlock()
-
-		// We should still validate it so we can log it
-		primaryID := n.getPrimaryID(req.View)
-		prePrepareCoreData, _ := prePrepareDataForSig(req.View, req.SequenceNumber, req.Digest.Hash)
-		if !n.verify(primaryID, prePrepareCoreData, req.Signature) {
-			return &pb.Ack{Success: false, ErrorMessage: "invalid signature"}, nil
-		}
-		d, err := digest(req.Request)
-		if err != nil || !bytes.Equal(d, req.Digest.Hash) {
-			return &pb.Ack{Success: false, ErrorMessage: "digest mismatch"}, nil
-		}
-
-		n.MessageLog[req.SequenceNumber] = &InternalLogEntry{
-			SequenceNumber: req.SequenceNumber,
-			View:           req.View,
-			Digest:         req.Digest.Hash,
-			Request:        req.Request,
-			Status:         StatusPrePrepared, // Log it as pre-prepared
-			PrePrepareMsg:  req,
-			PrepareVotes:   make(map[int]*pb.PrepareRequest),
-			CommitVotes:    make(map[int]*pb.CommitRequest),
-		}
-		log.Printf("Node %d (Backup) [ATTACK]: Logged PrePrepare seq=%d but will NOT send Prepare.", n.ID, req.SequenceNumber)
-		return &pb.Ack{Success: true}, nil // Lie and say we're fine
+	if req.Digest == nil || req.Request == nil {
+		return &pb.Ack{Success: false, ErrorMessage: "malformed PrePrepare"}, nil
 	}
 
 	n.mu.Lock()
-	log.Printf("Node %d received PrePrepare from primary for seq=%d view=%d", n.ID, req.SequenceNumber, req.View)
+	defer n.mu.Unlock()
 
 	primaryID := n.getPrimaryID(req.View)
 	prePrepareCoreData, err := prePrepareDataForSig(req.View, req.SequenceNumber, req.Digest.Hash)
 	if err != nil {
-		n.mu.Unlock()
 		log.Printf("Node %d: Failed to serialize PrePrepare for verification: %v", n.ID, err)
 		return &pb.Ack{Success: false, ErrorMessage: "internal error"}, nil
 	}
-
 	if !n.verify(primaryID, prePrepareCoreData, req.Signature) {
 		log.Printf("Node %d: Invalid signature on PrePrepare from node %d", n.ID, primaryID)
-		n.mu.Unlock()
 		return &pb.Ack{Success: false, ErrorMessage: "invalid signature"}, nil
 	}
-
-	// --- Check if we're in a view change ---
-	if n.State == StateViewChanging && req.View < n.View {
-		log.Printf("Node %d: In ViewChanging state, ignoring old PrePrepare for view %d", n.ID, req.View)
-		n.mu.Unlock()
-		return &pb.Ack{Success: false, ErrorMessage: "node in view change"}, nil
+	d, err := digest(req.Request)
+	if err != nil || !bytes.Equal(d, req.Digest.Hash) {
+		log.Printf("Node %d: Digest mismatch for PrePrepare seq %d view %d!", n.ID, req.SequenceNumber, req.View)
+		return &pb.Ack{Success: false, ErrorMessage: "digest mismatch"}, nil
 	}
+
+	// --- Attack Logic: Crash (as Backup) ---
+	if n.AttackModes["crash"] {
+		log.Printf("Node %d (Backup) [ATTACK]: Crashing. Received PrePrepare for seq %d but will not send Prepare.", n.ID, req.SequenceNumber)
+		if existing, ok := n.MessageLog[req.SequenceNumber]; !ok || existing.View < req.View {
+			n.MessageLog[req.SequenceNumber] = newLogEntry(req)
+		}
+		return &pb.Ack{Success: true}, nil // Lie and say we're fine
+	}
+	// --- End Attack Logic ---
+
+	log.Printf("Node %d received PrePrepare from primary for seq=%d view=%d", n.ID, req.SequenceNumber, req.View)
 
 	if req.View < n.View {
 		log.Printf("Node %d: Received PrePrepare for old view %d (current %d)", n.ID, req.View, n.View)
-		n.mu.Unlock()
 		return &pb.Ack{Success: false, ErrorMessage: "old view"}, nil
 	}
 
 	if req.SequenceNumber <= n.Watermarks.Low || req.SequenceNumber > n.Watermarks.High {
 		log.Printf("Node %d: PrePrepare seq num %d outside watermarks [%d, %d]", n.ID, req.SequenceNumber, n.Watermarks.Low, n.Watermarks.High)
-		n.mu.Unlock()
 		return &pb.Ack{Success: false, ErrorMessage: "sequence number out of bounds"}, nil
 	}
 
-	existingEntry, ok := n.MessageLog[req.SequenceNumber]
-	if ok && existingEntry.View == req.View && !bytes.Equal(existingEntry.Digest, req.Digest.Hash) {
-		log.Printf("Node %d: Conflicting PrePrepare for seq %d view %d!", n.ID, req.SequenceNumber, req.View)
-
-		// This is an equivocation attack by the primary! Trigger a view change.
-		log.Printf("Node %d: Equivocation detected! Triggering view change.", n.ID)
-		n.startViewChange() // We need to hold the lock for this
-
-		// n.mu.Unlock() // startViewChange now unlocks/relocks
-		return &pb.Ack{Success: false, ErrorMessage: "conflicting digest for same seq/view"}, nil
-	}
-
-	d, err := digest(req.Request)
-	if err != nil || !bytes.Equal(d, req.Digest.Hash) {
-		log.Printf("Node %d: Digest mismatch for PrePrepare seq %d view %d!", n.ID, req.SequenceNumber, req.View)
-		n.mu.Unlock()
-		return &pb.Ack{Success: false, ErrorMessage: "digest mismatch"}, nil
-	}
-
-	if !ok || existingEntry.View < req.View {
-		n.MessageLog[req.SequenceNumber] = &InternalLogEntry{
-			SequenceNumber: req.SequenceNumber,
-			View:           req.View,
-			Digest:         req.Digest.Hash,
-			Request:        req.Request,
-			Status:         StatusPrePrepared,
-			PrePrepareMsg:  req,
-			PrepareVotes:   make(map[int]*pb.PrepareRequest),
-			CommitVotes:    make(map[int]*pb.CommitRequest),
+	entry, ok := n.MessageLog[req.SequenceNumber]
+	switch {
+	case !ok || entry.View < req.View:
+		fresh := newLogEntry(req)
+		if ok {
+			fresh.PreparedCert = entry.PreparedCert // keep the older certificate for view changes
 		}
-	} else {
-		existingEntry.Status = StatusPrePrepared
-		existingEntry.PrePrepareMsg = req
+		n.MessageLog[req.SequenceNumber] = fresh
+		entry = fresh
+
+	case entry.PrePrepareMsg != nil && !bytes.Equal(entry.Digest, req.Digest.Hash):
+		// Two different requests signed by the primary for the same (view, seq).
+		log.Printf("Node %d: Conflicting PrePrepare for seq %d view %d!", n.ID, req.SequenceNumber, req.View)
+		log.Printf("Node %d: Equivocation detected! Triggering view change.", n.ID)
+		n.startViewChange(n.View + 1)
+		return &pb.Ack{Success: false, ErrorMessage: "conflicting digest for same seq/view"}, nil
+
+	case !bytes.Equal(entry.Digest, req.Digest.Hash):
+		// We already hold a commit certificate for a different request at this (view, seq).
+		log.Printf("Node %d: PrePrepare for seq %d view %d conflicts with the commit certificate. Ignoring.", n.ID, req.SequenceNumber, req.View)
+		return &pb.Ack{Success: false, ErrorMessage: "conflicts with commit certificate"}, nil
+
+	default:
+		// Same view, same request. The FullPrepare or FullCommit for this seq may have
+		// overtaken this PrePrepare: fill in what is missing, never move the entry back.
+		if entry.Request == nil {
+			entry.Request = req.Request
+		}
+		if entry.PrePrepareMsg == nil {
+			entry.PrePrepareMsg = req
+		}
+		if entry.Status == StatusNone {
+			entry.Status = StatusPrePrepared
+		}
+		if entry.FullCommitRx && (entry.Status == StatusPrePrepared || entry.Status == StatusPrepared) {
+			entry.Status = StatusCommitted
+			n.attemptExecution()
+		}
 	}
 
-	log.Printf("Node %d PrePrepared seq=%d view=%d", n.ID, req.SequenceNumber, req.View)
+	log.Printf("Node %d PrePrepared seq=%d view=%d (status %s)", n.ID, req.SequenceNumber, req.View, entry.Status)
+
+	if entry.Status != StatusPrePrepared {
+		// Already prepared or committed through the FullPrepare/FullCommit path.
+		return &pb.Ack{Success: true}, nil
+	}
 
 	// As a backup, if we get a PrePrepare, we start a timer.
-	if timer, ok := n.requestTimers[req.SequenceNumber]; ok {
-		timer.Stop() // Stop and delete any existing timer for this seq
-	}
-	n.requestTimers[req.SequenceNumber] = time.AfterFunc(RequestTimeout, func() {
-		n.handleRequestTimeout(req.SequenceNumber, req.View)
-	})
+	n.startRequestTimer(req.SequenceNumber, req.View)
 	log.Printf("Node %d (Backup) started timer for seq %d", n.ID, req.SequenceNumber)
 
 	prepareCoreData, err := prepareDataForSig(req.View, req.SequenceNumber, req.Digest.Hash, int32(n.ID))
 	if err != nil {
-		n.mu.Unlock()
 		log.Printf("Node %d: Failed to serialize Prepare for signing: %v", n.ID, err)
 		return &pb.Ack{Success: true}, nil // Acknowledged PrePrepare, but failed to send Prepare
 	}
 
 	signature, err := n.sign(prepareCoreData)
 	if err != nil {
-		n.mu.Unlock()
 		log.Printf("Node %d: Failed to sign Prepare for seq %d: %v", n.ID, req.SequenceNumber, err)
 		return &pb.Ack{Success: true}, nil
 	}
@@ -794,7 +885,6 @@ func (n *Node) SendPrePrepare(ctx context.Context, req *pb.PrePrepareRequest) (*
 		ReplicaId:      int32(n.ID),
 		Signature:      signature,
 	}
-	n.mu.Unlock()
 
 	go n.sendToPeer(primaryID, prepareMsg, "Prepare")
 
@@ -802,6 +892,10 @@ func (n *Node) SendPrePrepare(ctx context.Context, req *pb.PrePrepareRequest) (*
 }
 
 func (n *Node) SendPrepare(ctx context.Context, req *pb.PrepareRequest) (*pb.Ack, error) {
+	if req.Digest == nil {
+		return &pb.Ack{Success: false, ErrorMessage: "malformed Prepare"}, nil
+	}
+
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
@@ -820,6 +914,10 @@ func (n *Node) SendPrepare(ctx context.Context, req *pb.PrepareRequest) (*pb.Ack
 	if req.View < n.View {
 		log.Printf("Node %d: Received Prepare for old view %d (current %d)", n.ID, req.View, n.View)
 		return &pb.Ack{Success: false, ErrorMessage: "old view"}, nil
+	}
+	if int(req.ReplicaId) == n.ID {
+		// The primary's PrePrepare already counts as its vote.
+		return &pb.Ack{Success: false, ErrorMessage: "primary does not vote with Prepare"}, nil
 	}
 
 	entry, ok := n.MessageLog[req.SequenceNumber]
@@ -851,29 +949,25 @@ func (n *Node) SendPrepare(ctx context.Context, req *pb.PrepareRequest) (*pb.Ack
 	entry.PrepareVotes[int(req.ReplicaId)] = req
 
 	if len(entry.PrepareVotes) >= (n.QuorumSize-1) && entry.Status == StatusPrePrepared {
-
-		if n.AttackModes["crash"] {
-			log.Printf("Node %d (Primary) [ATTACK]: Crashing. Reached Prepare quorum for seq %d but will not send FullPrepare.", n.ID, req.SequenceNumber)
-			entry.Status = StatusPrepared      // Log it
-			return &pb.Ack{Success: true}, nil // Lie and say we're fine
-		}
-
-		entry.Status = StatusPrepared
-		log.Printf("Node %d (Primary) has prepared seq=%d. Broadcasting FullPrepare.", n.ID, req.SequenceNumber)
-
-		// --- Broadcast FullPrepare ---
 		proofs := make([]*pb.PrepareRequest, 0, len(entry.PrepareVotes))
 		for _, proof := range entry.PrepareVotes {
 			proofs = append(proofs, proof)
 		}
+		entry.Status = StatusPrepared
+		entry.PreparedCert = &pb.PProof{PrePrepareReq: entry.PrePrepareMsg, PrepareReqs: proofs}
 
+		if n.AttackModes["crash"] {
+			log.Printf("Node %d (Primary) [ATTACK]: Crashing. Reached Prepare quorum for seq %d but will not send FullPrepare.", n.ID, req.SequenceNumber)
+			return &pb.Ack{Success: true}, nil // Lie and say we're fine
+		}
+
+		log.Printf("Node %d (Primary) has prepared seq=%d. Broadcasting FullPrepare.", n.ID, req.SequenceNumber)
+
+		// --- Broadcast FullPrepare ---
 		fullPrepareMsg := &pb.FullPrepareRequest{
 			PrePrepareProof: entry.PrePrepareMsg,
 			PrepareProofs:   proofs,
 		}
-
-		// Unlock before broadcast
-		n.mu.Unlock()
 		for peerID := range n.NodeAddrs {
 			if peerID == n.ID {
 				continue
@@ -882,8 +976,6 @@ func (n *Node) SendPrepare(ctx context.Context, req *pb.PrepareRequest) (*pb.Ack
 			// Use generic helper (checks for in-dark)
 			go n.sendToPeer(peerID, fullPrepareMsg, "FullPrepare")
 		}
-		// Re-lock because defer Unlock will fire
-		n.mu.Lock()
 	}
 
 	return &pb.Ack{Success: true}, nil
@@ -892,36 +984,33 @@ func (n *Node) SendPrepare(ctx context.Context, req *pb.PrepareRequest) (*pb.Ack
 // SendFullPrepare is called by the primary, handled by backups.
 // Implements "Crash" attack
 func (n *Node) SendFullPrepare(ctx context.Context, req *pb.FullPrepareRequest) (*pb.Ack, error) {
-	n.mu.Lock()
-
-	// --- Check if we're in a view change ---
-	if req.PrePrepareProof != nil && n.State == StateViewChanging && req.PrePrepareProof.View < n.View {
-		log.Printf("Node %d: In ViewChanging state, ignoring old FullPrepare for view %d", n.ID, req.PrePrepareProof.View)
-		n.mu.Unlock()
-		return &pb.Ack{Success: false, ErrorMessage: "node in view change"}, nil
-	}
-
-	if req.PrePrepareProof == nil {
-		n.mu.Unlock()
+	if req.PrePrepareProof == nil || req.PrePrepareProof.Digest == nil || req.PrePrepareProof.Request == nil {
 		log.Printf("Node %d: Received FullPrepare with missing PrePrepare proof", n.ID)
 		return &pb.Ack{Success: false, ErrorMessage: "missing PrePrepare proof"}, nil
 	}
 
-	v := req.PrePrepareProof.View
-	n_seq := req.PrePrepareProof.SequenceNumber
-	d_hash := req.PrePrepareProof.Digest.Hash
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	// --- Check if we're in a view change ---
+	if n.State == StateViewChanging && req.PrePrepareProof.View < n.View {
+		log.Printf("Node %d: In ViewChanging state, ignoring old FullPrepare for view %d", n.ID, req.PrePrepareProof.View)
+		return &pb.Ack{Success: false, ErrorMessage: "node in view change"}, nil
+	}
+
+	pp := req.PrePrepareProof
+	v := pp.View
+	n_seq := pp.SequenceNumber
+	d_hash := pp.Digest.Hash
 
 	// --- Attack Logic: Crash (as Backup) ---
 	// PDF: (a) fails to send any prepare messages [here, Commit]
 	if n.AttackModes["crash"] {
 		log.Printf("Node %d (Backup) [ATTACK]: Crashing. Received FullPrepare for seq %d but will not send Commit.", n.ID, n_seq)
-		n.mu.Unlock()
-		// We could validate and log, but for a crash, let's just stop.
 		return &pb.Ack{Success: true}, nil // Lie and say we're fine
 	}
 	// --- End Attack Logic ---
 
-	defer n.mu.Unlock() // Normal logic
 	primaryID := n.getPrimaryID(v)
 	log.Printf("Node %d (Backup) received FullPrepare: seq=%d view=%d", n.ID, n_seq, v)
 
@@ -930,16 +1019,19 @@ func (n *Node) SendFullPrepare(ctx context.Context, req *pb.FullPrepareRequest) 
 		log.Printf("Node %d: Received FullPrepare for old view %d (current %d)", n.ID, v, n.View)
 		return &pb.Ack{Success: false, ErrorMessage: "old view"}, nil
 	}
-	// TODO: Handle v > n.View
 
 	prePrepareCoreData, err := prePrepareDataForSig(v, n_seq, d_hash)
 	if err != nil {
 		log.Printf("Node %d: Failed to serialize PrePrepare for verification: %v", n.ID, err)
 		return &pb.Ack{Success: false, ErrorMessage: "internal verify error"}, nil
 	}
-	if !n.verify(primaryID, prePrepareCoreData, req.PrePrepareProof.Signature) {
+	if !n.verify(primaryID, prePrepareCoreData, pp.Signature) {
 		log.Printf("Node %d: Invalid signature on PrePrepareProof from primary %d", n.ID, primaryID)
 		return &pb.Ack{Success: false, ErrorMessage: "invalid PrePrepare signature"}, nil
+	}
+	if d, err := digest(pp.Request); err != nil || !bytes.Equal(d, d_hash) {
+		log.Printf("Node %d: Digest mismatch for request in FullPrepare seq %d!", n.ID, n_seq)
+		return &pb.Ack{Success: false, ErrorMessage: "digest mismatch on request"}, nil
 	}
 
 	if len(req.PrepareProofs) < (n.QuorumSize - 1) { // Need 2f=4 proofs
@@ -949,7 +1041,7 @@ func (n *Node) SendFullPrepare(ctx context.Context, req *pb.FullPrepareRequest) 
 
 	prepareSigners := make(map[int]bool)
 	for _, prep := range req.PrepareProofs {
-		if prep.View != v || prep.SequenceNumber != n_seq || !bytes.Equal(prep.Digest.Hash, d_hash) {
+		if prep.Digest == nil || prep.View != v || prep.SequenceNumber != n_seq || !bytes.Equal(prep.Digest.Hash, d_hash) {
 			log.Printf("Node %d: Received FullPrepare with inconsistent Prepare proof from %d", n.ID, prep.ReplicaId)
 			return &pb.Ack{Success: false, ErrorMessage: "inconsistent prepare proof"}, nil
 		}
@@ -971,34 +1063,47 @@ func (n *Node) SendFullPrepare(ctx context.Context, req *pb.FullPrepareRequest) 
 
 	// --- Log and Prepare ---
 	entry, ok := n.MessageLog[n_seq]
-	if !ok {
-		d, err := digest(req.PrePrepareProof.Request)
-		if err != nil || !bytes.Equal(d, d_hash) {
-			log.Printf("Node %d: Digest mismatch for request in FullPrepare seq %d!", n.ID, n_seq)
-			return &pb.Ack{Success: false, ErrorMessage: "digest mismatch on request"}, nil
+	switch {
+	case !ok || entry.View < v:
+		fresh := newLogEntry(pp)
+		if ok {
+			fresh.PreparedCert = entry.PreparedCert // keep the older certificate for view changes
 		}
-
-		n.MessageLog[n_seq] = &InternalLogEntry{
-			SequenceNumber: n_seq,
-			View:           v,
-			Digest:         d,
-			Request:        req.PrePrepareProof.Request,
-			Status:         StatusPrepared, // We have proof, so mark prepared
-			PrePrepareMsg:  req.PrePrepareProof,
-			PrepareVotes:   make(map[int]*pb.PrepareRequest),
-			CommitVotes:    make(map[int]*pb.CommitRequest),
+		n.MessageLog[n_seq] = fresh
+		entry = fresh
+	case !bytes.Equal(entry.Digest, d_hash):
+		log.Printf("Node %d: FullPrepare for seq %d view %d conflicts with the logged request. Ignoring.", n.ID, n_seq, v)
+		return &pb.Ack{Success: false, ErrorMessage: "conflicting request for seq/view"}, nil
+	default:
+		// Same view and request; the PrePrepare may not have arrived yet.
+		if entry.Request == nil {
+			entry.Request = pp.Request
 		}
-		entry = n.MessageLog[n_seq]
-	} else if entry.Status == StatusPrePrepared {
-		entry.Status = StatusPrepared
+		if entry.PrePrepareMsg == nil {
+			entry.PrePrepareMsg = pp
+		}
 	}
 
+	if entry.Status == StatusNone || entry.Status == StatusPrePrepared {
+		entry.Status = StatusPrepared // We have proof, so mark prepared
+	}
 	entry.FullPrepareRx = true
 	for _, p := range req.PrepareProofs {
 		entry.PrepareVotes[int(p.ReplicaId)] = p
 	}
+	entry.PreparedCert = &pb.PProof{PrePrepareReq: pp, PrepareReqs: req.PrepareProofs}
+
+	// The PrePrepare may have been lost or overtaken; make sure a timer guards this seq.
+	if _, hasTimer := n.requestTimers[n_seq]; !hasTimer && n_seq > n.LastExecuted {
+		n.startRequestTimer(n_seq, v)
+	}
 
 	log.Printf("Node %d (Backup) has prepared seq=%d.", n.ID, n_seq)
+
+	if entry.FullCommitRx && entry.Status == StatusPrepared {
+		entry.Status = StatusCommitted
+		n.attemptExecution()
+	}
 
 	// --- Send Commit back to Primary (Linear Step) ---
 	commitCoreData, err := commitDataForSig(v, n_seq, d_hash, int32(n.ID))
@@ -1015,18 +1120,13 @@ func (n *Node) SendFullPrepare(ctx context.Context, req *pb.FullPrepareRequest) 
 	commitMsg := &pb.CommitRequest{
 		View:           v,
 		SequenceNumber: n_seq,
-		Digest:         req.PrePrepareProof.Digest,
+		Digest:         pp.Digest,
 		ReplicaId:      int32(n.ID),
 		Signature:      signature,
 	}
 
-	n.mu.Unlock() // Unlock before network call
-
 	// Use generic helper (checks for in-dark)
 	go n.sendToPeer(primaryID, commitMsg, "Commit")
-
-	// Re-lock
-	n.mu.Lock()
 
 	return &pb.Ack{Success: true}, nil
 }
@@ -1034,6 +1134,10 @@ func (n *Node) SendFullPrepare(ctx context.Context, req *pb.FullPrepareRequest) 
 // SendCommit is called by backups, handled by the primary.
 // Implements "Crash" attack
 func (n *Node) SendCommit(ctx context.Context, req *pb.CommitRequest) (*pb.Ack, error) {
+	if req.Digest == nil {
+		return &pb.Ack{Success: false, ErrorMessage: "malformed Commit"}, nil
+	}
+
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
@@ -1052,12 +1156,15 @@ func (n *Node) SendCommit(ctx context.Context, req *pb.CommitRequest) (*pb.Ack, 
 	if req.View < n.View {
 		return &pb.Ack{Success: false, ErrorMessage: "old view"}, nil
 	}
+	if int(req.ReplicaId) == n.ID {
+		return &pb.Ack{Success: false, ErrorMessage: "primary does not vote with Commit"}, nil
+	}
 	entry, ok := n.MessageLog[req.SequenceNumber]
 	if !ok || entry.View != req.View {
 		return &pb.Ack{Success: false, ErrorMessage: "no matching log entry"}, nil
 	}
 	// Must be at least prepared to accept commits
-	if entry.Status == StatusPrePrepared {
+	if entry.Status == StatusNone || entry.Status == StatusPrePrepared {
 		return &pb.Ack{Success: false, ErrorMessage: "entry not prepared"}, nil
 	}
 	if !bytes.Equal(entry.Digest, req.Digest.Hash) {
@@ -1107,8 +1214,6 @@ func (n *Node) SendCommit(ctx context.Context, req *pb.CommitRequest) (*pb.Ack, 
 			CommitProofs:   proofs,
 		}
 
-		// Unlock before broadcast
-		n.mu.Unlock()
 		for peerID := range n.NodeAddrs {
 			if peerID == n.ID {
 				continue
@@ -1116,8 +1221,6 @@ func (n *Node) SendCommit(ctx context.Context, req *pb.CommitRequest) (*pb.Ack, 
 			// Use generic helper (checks for in-dark)
 			go n.sendToPeer(peerID, fullCommitMsg, "FullCommit")
 		}
-		// Re-lock
-		n.mu.Lock()
 	}
 
 	return &pb.Ack{Success: true}, nil
@@ -1125,6 +1228,10 @@ func (n *Node) SendCommit(ctx context.Context, req *pb.CommitRequest) (*pb.Ack, 
 
 // SendFullCommit is called by the primary, handled by backups.
 func (n *Node) SendFullCommit(ctx context.Context, req *pb.FullCommitRequest) (*pb.Ack, error) {
+	if req.Digest == nil {
+		return &pb.Ack{Success: false, ErrorMessage: "malformed FullCommit"}, nil
+	}
+
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
@@ -1151,7 +1258,7 @@ func (n *Node) SendFullCommit(ctx context.Context, req *pb.FullCommitRequest) (*
 
 	commitSigners := make(map[int]bool)
 	for _, com := range req.CommitProofs {
-		if com.View != v || com.SequenceNumber != n_seq || !bytes.Equal(com.Digest.Hash, d_hash) {
+		if com.Digest == nil || com.View != v || com.SequenceNumber != n_seq || !bytes.Equal(com.Digest.Hash, d_hash) {
 			return &pb.Ack{Success: false, ErrorMessage: "inconsistent commit proof"}, nil
 		}
 		commitCoreData, err := commitDataForSig(v, n_seq, d_hash, com.ReplicaId)
@@ -1169,18 +1276,53 @@ func (n *Node) SendFullCommit(ctx context.Context, req *pb.FullCommitRequest) (*
 
 	// --- Log and Execute ---
 	entry, ok := n.MessageLog[n_seq]
-	if !ok {
-		log.Printf("Node %d: Received FullCommit for unknown seq %d", n.ID, n_seq)
-		return &pb.Ack{Success: false, ErrorMessage: "entry not known"}, nil
+	if ok && entry.View < v && entry.Request != nil && bytes.Equal(entry.Digest, d_hash) {
+		// Same request re-proposed in a newer view; the certificate covers it.
+		entry.View = v
+	}
+	if !ok || entry.View < v || entry.Request == nil {
+		// The FullCommit overtook the PrePrepare/FullPrepare. Remember the certificate
+		// and commit as soon as the request itself arrives.
+		log.Printf("Node %d: FullCommit for seq %d arrived before the request. Holding it.", n.ID, n_seq)
+		if !ok || entry.View < v {
+			placeholder := &InternalLogEntry{
+				SequenceNumber: n_seq,
+				View:           v,
+				Digest:         d_hash,
+				Status:         StatusNone,
+				PrepareVotes:   make(map[int]*pb.PrepareRequest),
+				CommitVotes:    make(map[int]*pb.CommitRequest),
+			}
+			if ok {
+				placeholder.PreparedCert = entry.PreparedCert
+			}
+			n.MessageLog[n_seq] = placeholder
+			entry = placeholder
+		}
+		entry.FullCommitRx = true
+		return &pb.Ack{Success: true}, nil
+	}
+	if !bytes.Equal(entry.Digest, d_hash) {
+		log.Printf("Node %d: FullCommit digest for seq %d does not match the logged request", n.ID, n_seq)
+		return &pb.Ack{Success: false, ErrorMessage: "digest mismatch"}, nil
 	}
 
-	// Only move to committed if it was prepared
-	if entry.Status == StatusPrepared {
+	// 2f matching Commits plus the primary's are proof the request committed, even if
+	// our own FullPrepare has not arrived yet.
+	if entry.Status != StatusCommitted && entry.Status != StatusExecuted {
 		entry.Status = StatusCommitted
 	}
 	entry.FullCommitRx = true
 
 	log.Printf("Node %d (Backup) has committed seq=%d.", n.ID, n_seq)
+
+	if n_seq <= n.LastExecuted {
+		// Re-proposal of a request we already executed; nothing left to wait for.
+		if timer, ok := n.requestTimers[n_seq]; ok {
+			timer.Stop()
+			delete(n.requestTimers, n_seq)
+		}
+	}
 
 	// Execute request (must be in order)
 	n.attemptExecution()
@@ -1188,11 +1330,44 @@ func (n *Node) SendFullCommit(ctx context.Context, req *pb.FullCommitRequest) (*
 	return &pb.Ack{Success: true}, nil
 }
 
+// applyTransaction executes one client operation against the DB and returns the result.
+// MUST be called with the lock held.
+func (n *Node) applyTransaction(tx *pb.Transaction) string {
+	if tx == nil {
+		return "success"
+	}
+
+	// --- Handle Read Requests (read-only, or re-sent through consensus) ---
+	if isReadOnly(tx) || isConsensusRead(tx) {
+		if val, ok := n.DB[tx.Sender]; ok {
+			return fmt.Sprintf("Balance: %d", val)
+		}
+		n.DB[tx.Sender] = 10 // Initialize if not present
+		return "Balance: 10"
+	}
+
+	// --- Handle Read-Write Request ---
+	if _, ok := n.DB[tx.Sender]; !ok {
+		n.DB[tx.Sender] = 10
+	}
+	if _, ok := n.DB[tx.Receiver]; !ok {
+		n.DB[tx.Receiver] = 10
+	}
+
+	if n.DB[tx.Sender] >= tx.Amount {
+		n.DB[tx.Sender] -= tx.Amount
+		n.DB[tx.Receiver] += tx.Amount
+		return "success"
+	}
+	return "failed: insufficient funds"
+}
+
 // attemptExecution is a helper function to execute all possible
 // requests in strict sequence order.
-// Stops timers and implements "Crash" attack for replies.
+// Stops timers and wakes up the client handlers waiting for a reply.
 // MUST be called with the lock held.
 func (n *Node) attemptExecution() {
+	executedAny := false
 	for {
 		seqToExec := n.LastExecuted + 1
 		entry, ok := n.MessageLog[seqToExec]
@@ -1201,7 +1376,7 @@ func (n *Node) attemptExecution() {
 			break
 		}
 
-		if entry.Status != StatusCommitted {
+		if entry.Status != StatusCommitted || entry.Request == nil {
 			// The next required request is not committed yet, so we stop.
 			break
 		}
@@ -1217,89 +1392,44 @@ func (n *Node) attemptExecution() {
 
 		// --- Execute the request ---
 		result := "success" // Default to success for no-ops
-		if entry.Request != nil {
-			tx := entry.Request.Transaction
-
-			// --- Handle Read-Only Request ---
-			// A read-only request has a sender but no receiver/amount
-			if tx.Receiver == "" && tx.Amount == 0 && entry.Request.ClientId != "no-op" {
-				if val, ok := n.DB[tx.Sender]; ok {
-					result = fmt.Sprintf("Balance: %d", val)
-				} else {
-					n.DB[tx.Sender] = 10 // Initialize if not present
-					result = "Balance: 10"
-				}
-			} else if entry.Request.ClientId != "no-op" {
-				// --- Handle Read-Write Request ---
-				if _, ok := n.DB[tx.Sender]; !ok {
-					n.DB[tx.Sender] = 10
-				}
-				if _, ok := n.DB[tx.Receiver]; !ok {
-					n.DB[tx.Receiver] = 10
-				}
-
-				if n.DB[tx.Sender] >= tx.Amount {
-					n.DB[tx.Sender] -= tx.Amount
-					n.DB[tx.Receiver] += tx.Amount
-				} else {
-					result = "failed: insufficient funds"
-				}
+		req := entry.Request
+		if req.ClientId != NoOpClientID {
+			reqKey := requestKey(req)
+			if rec, done := n.executedReqs[reqKey]; done {
+				// The same request was already executed at another sequence number
+				// (e.g. an equivocating primary assigned it twice). Never apply it twice.
+				result = rec.result
+				log.Printf("Node %d: seq=%d repeats already-executed request %s. Not applying it again.", n.ID, seqToExec, reqKey)
+			} else {
+				result = n.applyTransaction(req.Transaction)
+				n.executedReqs[reqKey] = execRecord{result: result, view: entry.View}
 			}
-			// If it's a "no-op", result just stays "success"
+
+			// Wake up every SubmitRequest handler waiting on this request
+			delete(n.pendingRequests, reqKey)
+			delete(n.proposedInView, reqKey)
+			if done, ok := n.execWaiters[reqKey]; ok {
+				close(done)
+				delete(n.execWaiters, reqKey)
+			}
 		}
+		// If it's a "no-op", result just stays "success"
 
 		entry.Status = StatusExecuted
 		n.LastExecuted = seqToExec
+		// No stable checkpoints yet, so slide the window with execution.
+		n.Watermarks.High = n.LastExecuted + WatermarkRange
+		executedAny = true
 		log.Printf("Node %d EXECUTED seq=%d with result: %s", n.ID, seqToExec, result)
 
 		// TODO: Trigger checkpointing if n.LastExecuted % CheckpointPeriod == 0
 
-		// --- Reply to Client (if this node has a pending handler) ---
-		if entry.Request != nil && entry.Request.ClientId != "no-op" {
-			reqKey := fmt.Sprintf("%s-%d", entry.Request.ClientId, entry.Request.Timestamp)
-
-			// Check if we have a pending client reply channel for this request
-			if replyChan, ok := n.pendingClientReplies[reqKey]; ok {
-
-				replyCoreData, err := clientReplyDataForSig(entry.View, entry.Request.Timestamp, entry.Request.ClientId, int32(n.ID), result)
-				if err != nil {
-					log.Printf("Node %d: Failed to serialize reply for signing: %v", n.ID, err)
-					continue
-				}
-
-				signature, err := n.sign(replyCoreData)
-				if err != nil {
-					log.Printf("Node %d: Failed to sign reply for seq %d: %v", n.ID, seqToExec, err)
-					continue
-				}
-
-				clientReply := &pb.ClientReply{
-					View:      entry.View,
-					Timestamp: entry.Request.Timestamp,
-					ClientId:  entry.Request.ClientId,
-					ReplicaId: int32(n.ID),
-					Result:    result,
-					Signature: signature,
-				}
-
-				// --- Attack Logic: Crash (Reply) ---
-				// PDF: "does not send reply messages back to clients"
-				if n.AttackModes["crash"] {
-					log.Printf("Node %d [ATTACK]: Crashing. *NOT* sending reply for seq %d to client.", n.ID, seqToExec)
-					// We just don't send on the channel. The client will time out.
-				} else {
-					// --- Normal Reply ---
-					// Send the reply back to the original SubmitRequest goroutine
-					select {
-					case replyChan <- clientReply:
-						log.Printf("Node %d sent reply for seq=%d (key=%s) to client handler", n.ID, seqToExec, reqKey)
-					default:
-						log.Printf("Node %d reply channel for seq=%d (key=%s) was full/closed.", n.ID, seqToExec, reqKey)
-					}
-				}
-			}
-		}
 		// Loop again to try executing the *next* sequence number
+	}
+
+	if executedAny {
+		// The window moved; a primary can now propose requests that were waiting.
+		n.proposePending()
 	}
 }
 
@@ -1309,7 +1439,7 @@ func (n *Node) handleRequestTimeout(seqNum int64, view int32) {
 	defer n.mu.Unlock()
 
 	// 1. Check if the request was already executed or the view has changed
-	if entry, ok := n.MessageLog[seqNum]; ok && entry.Status == StatusExecuted {
+	if seqNum <= n.LastExecuted {
 		log.Printf("Node %d: Timer fired for seq %d, but it was already executed. Ignoring.", n.ID, seqNum)
 		delete(n.requestTimers, seqNum)
 		return
@@ -1321,9 +1451,9 @@ func (n *Node) handleRequestTimeout(seqNum int64, view int32) {
 		return
 	}
 
-	// 2. If we are already view-changing for this *next* view, ignore
-	if n.State == StateViewChanging && n.viewChangeVotes[n.View+1] != nil {
-		log.Printf("Node %d: Timer fired for seq %d, but already changing to view %d.", n.ID, seqNum, n.View+1)
+	// 2. If we are already changing views, the view-change timer is in charge
+	if n.State == StateViewChanging {
+		log.Printf("Node %d: Timer fired for seq %d, but already changing to view %d.", n.ID, seqNum, n.View)
 		return
 	}
 
@@ -1331,67 +1461,56 @@ func (n *Node) handleRequestTimeout(seqNum int64, view int32) {
 	log.Printf("Node %d: TIMER EXPIRED for seq %d (view %d). Leader is faulty! TRIGGERING VIEW CHANGE.", n.ID, seqNum, view)
 	delete(n.requestTimers, seqNum)
 
-	n.startViewChange()
+	n.startViewChange(n.View + 1)
 }
 
-// startViewChange begins the view change protocol
-func (n *Node) startViewChange() {
-	// This function must be called with the lock HELD
+// startViewChange moves this replica to view `target` and broadcasts its VIEW-CHANGE.
+// MUST be called with the lock held.
+func (n *Node) startViewChange(target int32) {
+	if target <= n.View {
+		return // already in, or changing to, this view or a later one
+	}
 
-	newView := n.View + 1
 	n.State = StateViewChanging
-	n.View = newView // Tentatively update view to stop processing old messages
-	log.Printf("Node %d: Entering state %s for view %d", n.ID, n.State, newView)
+	n.View = target // Tentatively update view to stop processing old messages
+	log.Printf("Node %d: Entering state %s for view %d", n.ID, n.State, target)
 
 	// Clear out any old request timers
 	for seq, timer := range n.requestTimers {
 		timer.Stop()
 		delete(n.requestTimers, seq)
 	}
+	if n.viewTimer != nil {
+		n.viewTimer.Stop()
+	}
 
 	// --- 1. Build the P-set (Prepared Proofs) ---
-	// Per PDF, this includes requests that the replica has prepared.
-	// Since checkpointing is a bonus, min-s (last checkpoint) is 0.
-	// So we look for *all* prepared messages in our log.
-
+	// Every request this replica has prepared (including ones that already committed
+	// or executed) above the low watermark. Checkpointing is a bonus, so min-s is 0.
 	preparedProofs := make([]*pb.PProof, 0)
-	for _, entry := range n.MessageLog {
-		// We only need to send proof for requests that are *at least* prepared
-		// but *not* yet executed (or committed, as execution is the final state)
-		if entry.Status == StatusPrepared && entry.PrePrepareMsg != nil {
-
-			// We need 2f matching Prepare messages. In our Linear model,
-			// the backup only gets these in a FullPrepareRequest.
-			if entry.FullPrepareRx {
-				log.Printf("Node %d: Adding seq %d to P-set for view change", n.ID, entry.SequenceNumber)
-
-				// Collect the 2f votes
-				votes := make([]*pb.PrepareRequest, 0, len(entry.PrepareVotes))
-				for _, vote := range entry.PrepareVotes {
-					votes = append(votes, vote)
-				}
-
-				proof := &pb.PProof{
-					PrePrepareReq: entry.PrePrepareMsg,
-					PrepareReqs:   votes,
-				}
-				preparedProofs = append(preparedProofs, proof)
-			}
+	seqs := make([]int64, 0, len(n.MessageLog))
+	for seq, entry := range n.MessageLog {
+		if entry.PreparedCert != nil && seq > n.Watermarks.Low {
+			seqs = append(seqs, seq)
 		}
+	}
+	sort.Slice(seqs, func(i, j int) bool { return seqs[i] < seqs[j] })
+	for _, seq := range seqs {
+		log.Printf("Node %d: Adding seq %d to P-set for view change", n.ID, seq)
+		preparedProofs = append(preparedProofs, n.MessageLog[seq].PreparedCert)
 	}
 
 	// --- 2. Create and Sign the ViewChangeRequest ---
 	// As per PDF, checkpoint cert is not needed and min-s=0.
 	vcRequest := &pb.ViewChangeRequest{
-		NewView:          newView,
-		CheckpointSeqNum: 0,   // No checkpoints
-		CheckpointProof:  nil, // No checkpoints
+		NewView:          target,
+		CheckpointSeqNum: n.Watermarks.Low, // No checkpoints
+		CheckpointProof:  nil,              // No checkpoints
 		PreparedProof:    preparedProofs,
 		ReplicaId:        int32(n.ID),
 	}
 
-	// We need to sign this. The signature is over <VIEW-CHANGE, v+1, n, C, P, i>
-	// We'll create a simple helper to serialize this.
+	// The signature is over <VIEW-CHANGE, v+1, n, C, P, i>
 	vcData, err := viewChangeDataForSig(vcRequest)
 	if err != nil {
 		log.Printf("Node %d: Failed to serialize ViewChangeRequest for signing: %v", n.ID, err)
@@ -1405,18 +1524,47 @@ func (n *Node) startViewChange() {
 	vcRequest.Signature = signature
 
 	// --- 3. Store our own vote and broadcast ---
-	if _, ok := n.viewChangeVotes[newView]; !ok {
-		n.viewChangeVotes[newView] = make(map[int]*pb.ViewChangeRequest)
+	if _, ok := n.viewChangeVotes[target]; !ok {
+		n.viewChangeVotes[target] = make(map[int]*pb.ViewChangeRequest)
 	}
-	n.viewChangeVotes[newView][n.ID] = vcRequest
+	n.viewChangeVotes[target][n.ID] = vcRequest
+	n.viewChangeHistory = append(n.viewChangeHistory, vcRequest)
 
-	n.mu.Unlock() // Unlock before broadcasting
-	log.Printf("Node %d: Broadcasting ViewChangeRequest for view %d...", n.ID, newView)
+	log.Printf("Node %d: Broadcasting ViewChangeRequest for view %d...", n.ID, target)
 	for peerID := range n.NodeAddrs {
-		//if peerID == n.ID { continue } // We should send to ourselves too
+		if peerID == n.ID {
+			continue
+		}
 		go n.sendToPeer(peerID, vcRequest, "ViewChange")
 	}
-	n.mu.Lock() // Re-lock
+
+	// --- 4. View-change timer ---
+	// If no NewView installs this view in time, the new primary is faulty too:
+	// move on to the next view, waiting twice as long each time.
+	attempts := n.vcAttempts
+	if attempts > 3 {
+		attempts = 3
+	}
+	timeout := ViewChangeTimeout * time.Duration(1<<attempts)
+	n.viewTimer = time.AfterFunc(timeout, func() {
+		n.handleViewChangeTimeout(target)
+	})
+
+	// We may already hold a quorum for this view (we joined late).
+	n.checkNewView(target)
+}
+
+// handleViewChangeTimeout fires when a view change did not complete in time.
+func (n *Node) handleViewChangeTimeout(target int32) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if n.State != StateViewChanging || n.View != target {
+		return // the view was installed, or we already moved on
+	}
+	log.Printf("Node %d: VIEW-CHANGE TIMER EXPIRED for view %d (no NewView from primary %d). Moving to view %d.", n.ID, target, n.getPrimaryID(target), target+1)
+	n.vcAttempts++
+	n.startViewChange(target + 1)
 }
 
 // viewChangeDataForSig serializes the core ViewChange fields for signing/verification
@@ -1443,6 +1591,59 @@ func viewChangeDataForSig(req *pb.ViewChangeRequest) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// newViewDataForSig serializes the core NewView fields for signing/verification
+func newViewDataForSig(v int32, oSetSize int) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+	if err := enc.Encode(struct {
+		V int32
+		O int
+	}{v, oSetSize}); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// validViewChange checks the signature of a ViewChange message.
+func (n *Node) validViewChange(vc *pb.ViewChangeRequest) bool {
+	if vc == nil || vc.ReplicaId < 0 || int(vc.ReplicaId) >= n.N {
+		return false
+	}
+	vcData, err := viewChangeDataForSig(vc)
+	if err != nil {
+		return false
+	}
+	return n.verify(int(vc.ReplicaId), vcData, vc.Signature)
+}
+
+// validPreparedProof checks a P-set entry: the primary's signed PrePrepare plus 2f
+// matching, correctly signed Prepares from distinct backups.
+func (n *Node) validPreparedProof(p *pb.PProof) bool {
+	if p == nil || p.PrePrepareReq == nil || p.PrePrepareReq.Digest == nil || p.PrePrepareReq.Request == nil {
+		return false
+	}
+	pp := p.PrePrepareReq
+	ppData, err := prePrepareDataForSig(pp.View, pp.SequenceNumber, pp.Digest.Hash)
+	if err != nil || !n.verify(n.getPrimaryID(pp.View), ppData, pp.Signature) {
+		return false
+	}
+	if d, err := digest(pp.Request); err != nil || !bytes.Equal(d, pp.Digest.Hash) {
+		return false
+	}
+	signers := make(map[int]bool)
+	for _, prep := range p.PrepareReqs {
+		if prep == nil || prep.Digest == nil || prep.View != pp.View || prep.SequenceNumber != pp.SequenceNumber || !bytes.Equal(prep.Digest.Hash, pp.Digest.Hash) {
+			continue
+		}
+		data, err := prepareDataForSig(prep.View, prep.SequenceNumber, prep.Digest.Hash, prep.ReplicaId)
+		if err != nil || !n.verify(int(prep.ReplicaId), data, prep.Signature) {
+			continue
+		}
+		signers[int(prep.ReplicaId)] = true
+	}
+	return len(signers) >= n.QuorumSize-1
+}
+
 // --- View Change and Other Placeholders ---
 
 // SendViewChange is called by other nodes
@@ -1455,23 +1656,16 @@ func (n *Node) SendViewChange(ctx context.Context, req *pb.ViewChangeRequest) (*
 	log.Printf("Node %d: Received ViewChange from %d for view %d", n.ID, senderID, newView)
 
 	// --- 1. Validation ---
-	if newView < n.View {
-		log.Printf("Node %d: Received old ViewChange for view %d (current: %d). Ignoring.", n.ID, newView, n.View)
+	if newView < n.View || (newView == n.View && n.State == StateNormal) {
+		log.Printf("Node %d: Received ViewChange for view %d, but view %d is already installed. Ignoring.", n.ID, newView, n.View)
 		return &pb.Ack{Success: false, ErrorMessage: "old view"}, nil
 	}
 
 	// Verify signature
-	vcData, err := viewChangeDataForSig(req)
-	if err != nil {
-		log.Printf("Node %d: Failed to serialize ViewChange from %d for verification: %v", n.ID, senderID, err)
-		return &pb.Ack{Success: false, ErrorMessage: "internal verify error"}, nil
-	}
-	if !n.verify(senderID, vcData, req.Signature) {
+	if !n.validViewChange(req) {
 		log.Printf("Node %d: Received ViewChange from %d with INVALID signature. Ignoring.", n.ID, senderID)
 		return &pb.Ack{Success: false, ErrorMessage: "invalid signature"}, nil
 	}
-
-	// TODO: Validate the P-set in the request
 
 	// --- 2. Store the Vote ---
 	if _, ok := n.viewChangeVotes[newView]; !ok {
@@ -1483,75 +1677,92 @@ func (n *Node) SendViewChange(ctx context.Context, req *pb.ViewChangeRequest) (*
 		return &pb.Ack{Success: false, ErrorMessage: "duplicate view change message"}, nil
 	}
 	n.viewChangeVotes[newView][senderID] = req
+	n.viewChangeHistory = append(n.viewChangeHistory, req)
 	log.Printf("Node %d: Stored ViewChange vote from %d for view %d. Total votes: %d/%d", n.ID, senderID, newView, len(n.viewChangeVotes[newView]), n.QuorumSize)
 
-	// --- 3. Check for Quorum (2f+1) ---
-	if len(n.viewChangeVotes[newView]) >= n.QuorumSize {
-		log.Printf("Node %d: Achieved ViewChange quorum for view %d.", n.ID, newView)
-
-		// If we haven't already, transition our own state
-		if n.State != StateViewChanging || n.View < newView {
-			// This node was loyal and didn't start its own view change.
-			// It needs to trigger it now to catch up.
-			log.Printf("Node %d: Quorum received, triggering catch-up view change.", n.ID)
-			n.startViewChange()
-		}
-
-		// --- 4. If WE are the new Primary, send NewView ---
-		newPrimaryID := n.getPrimaryID(newView)
-		if n.ID == newPrimaryID {
-
-			if n.AttackModes["crash"] {
-				log.Printf("Node %d (Primary) [ATTACK]: Crashing. Received ViewChange quorum but will not send NewView.", n.ID)
-				return &pb.Ack{Success: true}, nil // Lie and say we're fine
-			}
-
-			log.Printf("Node %d: I AM THE NEW PRIMARY for view %d. Preparing NewView message.", n.ID, newView)
-			n.sendNewView(newView) // This is a new helper function
-		}
+	// --- 3. Join the view change ---
+	// f+1 replicas asking for a higher view include at least one correct replica,
+	// so this node joins even if its own timers have not fired.
+	if newView > n.View && len(n.viewChangeVotes[newView]) >= n.F+1 {
+		log.Printf("Node %d: f+1 ViewChange messages for view %d, joining the view change.", n.ID, newView)
+		n.startViewChange(newView)
 	}
 
+	// --- 4. If WE are the new Primary and have 2f+1 votes, send NewView ---
+	n.checkNewView(newView)
+
 	return &pb.Ack{Success: true}, nil
+}
+
+// checkNewView sends the NewView once the new primary holds 2f+1 ViewChange messages.
+// MUST be called with the lock held.
+func (n *Node) checkNewView(v int32) {
+	if n.State != StateViewChanging || n.View != v {
+		return
+	}
+	if len(n.viewChangeVotes[v]) < n.QuorumSize {
+		return
+	}
+	if n.getPrimaryID(v) != n.ID || n.newViewSent[v] {
+		return
+	}
+	log.Printf("Node %d: Achieved ViewChange quorum for view %d.", n.ID, v)
+
+	if n.AttackModes["crash"] {
+		log.Printf("Node %d (Primary) [ATTACK]: Crashing. Received ViewChange quorum but will not send NewView.", n.ID)
+		n.newViewSent[v] = true
+		return
+	}
+
+	log.Printf("Node %d: I AM THE NEW PRIMARY for view %d. Preparing NewView message.", n.ID, v)
+	n.sendNewView(v)
 }
 
 // sendNewView is called by the new primary after a ViewChange quorum
 func (n *Node) sendNewView(newView int32) {
 	// This function must be called with the lock HELD
 	log.Printf("Node %d (Primary): Constructing NewView for view %d", n.ID, newView)
+	n.newViewSent[newView] = true
 
 	// --- 1. Get the 2f+1 ViewChange messages (the V-set) ---
 	vSet := n.viewChangeVotes[newView]
+	senders := make([]int, 0, len(vSet))
+	for id := range vSet {
+		senders = append(senders, id)
+	}
+	sort.Ints(senders)
 	vSetProofs := make([]*pb.ViewChangeRequest, 0, len(vSet))
-	for _, vote := range vSet {
-		vSetProofs = append(vSetProofs, vote)
+	for _, id := range senders {
+		vSetProofs = append(vSetProofs, vSet[id])
 	}
 
 	// --- 2. Determine min-s and max-s ---
-	// min-s is 0 (no checkpoints)
+	// min-s is the low watermark (0, no checkpoints)
 	// max-s is the highest sequence number in any P-set
-	minS := int64(0)
-	maxS := int64(0)
+	minS := n.Watermarks.Low
+	maxS := minS
 	// We also need to find the "best" request for each sequence number
 	// Key: seqNum, Value: the request with the highest view
 	bestPSet := make(map[int64]*pb.PrePrepareRequest)
 
-	for _, vcMsg := range vSet {
+	for _, vcMsg := range vSetProofs {
 		for _, pProof := range vcMsg.PreparedProof {
+			if !n.validPreparedProof(pProof) {
+				log.Printf("Node %d (Primary): Ignoring invalid P-set entry from %d", n.ID, vcMsg.ReplicaId)
+				continue
+			}
 			seq := pProof.PrePrepareReq.SequenceNumber
 			view := pProof.PrePrepareReq.View
+			if seq <= minS {
+				continue
+			}
 
 			if seq > maxS {
 				maxS = seq
 			}
 
-			// Check if we have a proof for this seq num already
-			if existing, ok := bestPSet[seq]; ok {
-				// If this proof is from a higher view, it's better
-				if view > existing.View {
-					bestPSet[seq] = pProof.PrePrepareReq
-				}
-			} else {
-				// No proof yet, this is the best one so far
+			// If this proof is from a higher view, it's better
+			if existing, ok := bestPSet[seq]; !ok || view > existing.View {
 				bestPSet[seq] = pProof.PrePrepareReq
 			}
 		}
@@ -1564,68 +1775,95 @@ func (n *Node) sendNewView(newView int32) {
 
 	for n_seq := minS + 1; n_seq <= maxS; n_seq++ {
 		var newPrePrepare *pb.PrePrepareRequest
+		var err error
 
 		if bestReq, ok := bestPSet[n_seq]; ok {
 			// --- Case 1: A request was prepared. Re-propose it. ---
 			log.Printf("Node %d (Primary): Re-proposing seq %d for new view", n.ID, n_seq)
 			// We must sign this new PrePrepare with the *new view*
-			d, _ := digest(bestReq.Request)
-			newPrePrepare, _ = n.createSignedPrePrepare(newView, n_seq, d, bestReq.Request)
-
+			newPrePrepare, err = n.createSignedPrePrepare(newView, n_seq, bestReq.Digest.Hash, bestReq.Request)
 		} else {
 			// --- Case 2: No request was prepared. Propose a "no-op". ---
 			log.Printf("Node %d (Primary): Proposing NO-OP for seq %d for new view", n.ID, n_seq)
-			// A no-op is just a nil request. The digest is of an empty request.
-			noOpReq := &pb.ClientRequest{ClientId: "no-op"}
+			noOpReq := &pb.ClientRequest{ClientId: NoOpClientID}
 			d, _ := digest(noOpReq)
-			newPrePrepare, _ = n.createSignedPrePrepare(newView, n_seq, d, noOpReq)
+			newPrePrepare, err = n.createSignedPrePrepare(newView, n_seq, d, noOpReq)
 		}
-
+		if err != nil {
+			log.Printf("Node %d (Primary): Failed to sign O-set PrePrepare for seq %d: %v", n.ID, n_seq, err)
+			return
+		}
 		oSet = append(oSet, newPrePrepare)
-		// We also need to log these new PrePrepares ourselves
-		n.logPrePrepare(newPrePrepare)
 	}
-
-	// Update our own SeqNum to be the new max
-	n.SeqNum = maxS
 
 	// --- 4. Create, sign, and broadcast the NewView message ---
-	newViewRequest := &pb.NewViewRequest{
-		NewView:            newView,
-		ViewChangeProof:    vSetProofs,
-		ReproposedRequests: oSet,
-	}
-
-	// We need a deterministic way to sign this
-	// For now, let's just sign the view number and number of proofs
-	var buf bytes.Buffer
-	enc := gob.NewEncoder(&buf)
-	if err := enc.Encode(struct {
-		V int32
-		O int
-	}{newView, len(oSet)}); err != nil {
-		// Handle the error, e.g., log it and return
+	nvData, err := newViewDataForSig(newView, len(oSet))
+	if err != nil {
 		log.Printf("Node %d (Primary): Failed to encode NewView for signing: %v", n.ID, err)
 		return
 	}
-	nvData := buf.Bytes()
 	signature, err := n.sign(nvData)
 	if err != nil {
 		log.Printf("Node %d (Primary): Failed to sign NewView: %v", n.ID, err)
 		return
 	}
-	newViewRequest.Signature = signature
+	newViewRequest := &pb.NewViewRequest{
+		NewView:            newView,
+		ViewChangeProof:    vSetProofs,
+		ReproposedRequests: oSet,
+		Signature:          signature,
+	}
 
 	// We are now in the new view
-	n.State = StateNormal
-	n.View = newView
+	n.installView(newView)
 
-	n.mu.Unlock() // Unlock before broadcasting
+	// We also need to log these new PrePrepares ourselves
+	for _, pp := range oSet {
+		n.logPrePrepare(pp)
+		if pp.Request.ClientId != NoOpClientID {
+			n.proposedInView[requestKey(pp.Request)] = newView
+		}
+	}
+
+	// Update our own SeqNum to be the new max
+	n.SeqNum = maxS
+	if n.LastExecuted > n.SeqNum {
+		n.SeqNum = n.LastExecuted
+	}
+
 	log.Printf("Node %d (Primary): Broadcasting NewView for view %d", n.ID, newView)
 	for peerID := range n.NodeAddrs {
+		if peerID == n.ID {
+			continue // we already processed it
+		}
 		go n.sendToPeer(peerID, newViewRequest, "NewView")
 	}
-	n.mu.Lock() // Re-lock
+
+	// Client requests that are still waiting and were not re-proposed above.
+	n.proposePending()
+}
+
+// installView switches this replica into newView in the Normal state.
+// MUST be called with the lock held.
+func (n *Node) installView(newView int32) {
+	n.State = StateNormal
+	n.View = newView
+	n.vcAttempts = 0
+	if n.viewTimer != nil {
+		n.viewTimer.Stop()
+		n.viewTimer = nil
+	}
+	// Clear old timers
+	for seq, timer := range n.requestTimers {
+		timer.Stop()
+		delete(n.requestTimers, seq)
+	}
+	// Clear view change votes for this and older views (history is kept for printview)
+	for v := range n.viewChangeVotes {
+		if v <= newView {
+			delete(n.viewChangeVotes, v)
+		}
+	}
 }
 
 // SendNewView is called by the new primary, handled by backups
@@ -1638,97 +1876,99 @@ func (n *Node) SendNewView(ctx context.Context, req *pb.NewViewRequest) (*pb.Ack
 	log.Printf("Node %d: Received NewView from primary %d for view %d", n.ID, senderID, newView)
 
 	// --- 1. Validation ---
-	if newView < n.View {
-		log.Printf("Node %d: Received old NewView for view %d (current: %d). Ignoring.", n.ID, newView, n.View)
+	if senderID == n.ID {
+		return &pb.Ack{Success: true}, nil // our own NewView, already processed
+	}
+	if newView < n.View || (newView == n.View && n.State == StateNormal) {
+		log.Printf("Node %d: Received NewView for view %d, but view %d is already installed. Ignoring.", n.ID, newView, n.View)
 		return &pb.Ack{Success: false, ErrorMessage: "old view"}, nil
 	}
 
 	// Validate signature
-	var buf bytes.Buffer
-	enc := gob.NewEncoder(&buf)
-	if err := enc.Encode(struct {
-		V int32
-		O int
-	}{newView, len(req.ReproposedRequests)}); err != nil {
+	nvData, err := newViewDataForSig(newView, len(req.ReproposedRequests))
+	if err != nil {
 		log.Printf("Node %d: Failed to encode NewView for signature verification: %v", n.ID, err)
 		return &pb.Ack{Success: false, ErrorMessage: "internal verify error"}, nil
 	}
-	nvData := buf.Bytes()
 	if !n.verify(senderID, nvData, req.Signature) {
 		log.Printf("Node %d: Received NewView from %d with INVALID signature. Ignoring.", n.ID, senderID)
 		return &pb.Ack{Success: false, ErrorMessage: "invalid signature"}, nil
 	}
 
-	// Validate V-set (the ViewChange proofs)
-	if len(req.ViewChangeProof) < n.QuorumSize {
-		log.Printf("Node %d: Received NewView with insufficient V-set proofs (%d/%d). Ignoring.", n.ID, len(req.ViewChangeProof), n.QuorumSize)
+	// Validate V-set: 2f+1 correctly signed ViewChange messages for this view from distinct replicas
+	vcSenders := make(map[int]bool)
+	for _, vc := range req.ViewChangeProof {
+		if vc.NewView == newView && n.validViewChange(vc) {
+			vcSenders[int(vc.ReplicaId)] = true
+		}
+	}
+	if len(vcSenders) < n.QuorumSize {
+		log.Printf("Node %d: Received NewView with insufficient V-set proofs (%d/%d). Ignoring.", n.ID, len(vcSenders), n.QuorumSize)
 		return &pb.Ack{Success: false, ErrorMessage: "insufficient view change proofs"}, nil
 	}
 
-	// TODO: Full validation would re-verify every signature in the V-set
-	// For now, we trust the primary did this.
-	// TODO: Validate O-set against V-set
+	// Validate O-set: every PrePrepare is for the new view, signed by its primary, with a matching digest
+	for _, pp := range req.ReproposedRequests {
+		if pp.Digest == nil || pp.Request == nil || pp.View != newView {
+			return &pb.Ack{Success: false, ErrorMessage: "malformed O-set"}, nil
+		}
+		ppData, err := prePrepareDataForSig(pp.View, pp.SequenceNumber, pp.Digest.Hash)
+		if err != nil || !n.verify(senderID, ppData, pp.Signature) {
+			return &pb.Ack{Success: false, ErrorMessage: "invalid O-set signature"}, nil
+		}
+		if d, err := digest(pp.Request); err != nil || !bytes.Equal(d, pp.Digest.Hash) {
+			return &pb.Ack{Success: false, ErrorMessage: "O-set digest mismatch"}, nil
+		}
+	}
+	// TODO: Recompute the O-set from the V-set and compare
 
 	// --- 2. State Transition ---
-	n.State = StateNormal
-	n.View = newView
-	n.SeqNum = n.LastExecuted // Reset SeqNum, will be updated by O-set
-
-	// Clear old timers
-	for seq, timer := range n.requestTimers {
-		timer.Stop()
-		delete(n.requestTimers, seq)
-	}
-	// Clear old view change votes
-	n.viewChangeVotes = make(map[int32]map[int]*pb.ViewChangeRequest)
-
+	n.installView(newView)
 	log.Printf("Node %d (Backup): ACCEPTED NewView. Transitioned to view %d.", n.ID, newView)
 
 	// --- 3. Process the O-set (new PrePrepares) ---
-	n.mu.Unlock() // Unlock to call logPrePrepare (which locks)
-	var maxSeq int64 = 0
-	for _, prePrepare := range req.ReproposedRequests {
+	oSet := append([]*pb.PrePrepareRequest(nil), req.ReproposedRequests...)
+	sort.Slice(oSet, func(i, j int) bool { return oSet[i].SequenceNumber < oSet[j].SequenceNumber })
+	maxSeq := n.LastExecuted
+	for _, prePrepare := range oSet {
 		n.logAndProcessPrePrepare(prePrepare)
 		if prePrepare.SequenceNumber > maxSeq {
 			maxSeq = prePrepare.SequenceNumber // Update our sequence number
 		}
 	}
-	n.mu.Lock() // Re-lock
 	n.SeqNum = maxSeq
 
 	return &pb.Ack{Success: true}, nil
 }
 
-// logAndProcessPrePrepare is a helper for backups to handle re-proposed requests
+// logAndProcessPrePrepare is a helper for backups to handle re-proposed requests.
+// MUST be called with the lock held.
 func (n *Node) logAndProcessPrePrepare(req *pb.PrePrepareRequest) {
-	n.mu.Lock()
-
 	// 1. Log the new PrePrepare
 	if !n.logPrePrepare(req) {
 		log.Printf("Node %d (Backup): Failed to log re-proposed PrePrepare for seq %d", n.ID, req.SequenceNumber)
-		n.mu.Unlock()
 		return
 	}
 
-	// 2. Start the request timer
-	if timer, ok := n.requestTimers[req.SequenceNumber]; ok {
-		timer.Stop()
+	// --- Attack Logic: Crash (as Backup) ---
+	if n.AttackModes["crash"] {
+		return // logs it, never sends Prepare
 	}
-	n.requestTimers[req.SequenceNumber] = time.AfterFunc(RequestTimeout, func() {
-		n.handleRequestTimeout(req.SequenceNumber, req.View)
-	})
+
+	// 2. Start the request timer (unless we already executed this seq)
+	if req.SequenceNumber > n.LastExecuted {
+		n.startRequestTimer(req.SequenceNumber, req.View)
+	}
 
 	// 3. Send Prepare to the new primary
 	prepareCoreData, err := prepareDataForSig(req.View, req.SequenceNumber, req.Digest.Hash, int32(n.ID))
 	if err != nil {
 		log.Printf("Node %d: Failed to serialize Prepare for signing: %v", n.ID, err)
-		n.mu.Unlock()
 		return
 	}
 	signature, err := n.sign(prepareCoreData)
 	if err != nil {
 		log.Printf("Node %d: Failed to sign Prepare for seq %d: %v", n.ID, req.SequenceNumber, err)
-		n.mu.Unlock()
 		return
 	}
 
@@ -1740,11 +1980,12 @@ func (n *Node) logAndProcessPrePrepare(req *pb.PrePrepareRequest) {
 		Signature:      signature,
 	}
 
-	n.mu.Unlock() // Unlock before sending
 	go n.sendToPeer(n.getPrimaryID(req.View), prepareMsg, "Prepare")
 }
 
-// logPrePrepare is a helper to log a PrePrepare (used by primary and backups)
+// logPrePrepare is a helper to log a PrePrepare (used by primary and backups).
+// A PrePrepare for an existing seq replaces the entry's request and resets its votes
+// (used when a new primary re-proposes); the older prepared certificate is kept.
 func (n *Node) logPrePrepare(req *pb.PrePrepareRequest) bool {
 	// Assumes lock is HELD
 
@@ -1754,27 +1995,26 @@ func (n *Node) logPrePrepare(req *pb.PrePrepareRequest) bool {
 		return false
 	}
 
-	if _, ok := n.MessageLog[req.SequenceNumber]; !ok {
-		n.MessageLog[req.SequenceNumber] = &InternalLogEntry{
-			SequenceNumber: req.SequenceNumber,
-			View:           req.View,
-			Digest:         req.Digest.Hash,
-			Request:        req.Request,
-			Status:         StatusPrePrepared,
-			PrePrepareMsg:  req,
-			PrepareVotes:   make(map[int]*pb.PrepareRequest),
-			CommitVotes:    make(map[int]*pb.CommitRequest),
-		}
-	} else {
-		// Entry exists, just update it
-		n.MessageLog[req.SequenceNumber].View = req.View
-		n.MessageLog[req.SequenceNumber].Status = StatusPrePrepared
-		n.MessageLog[req.SequenceNumber].PrePrepareMsg = req
-		n.MessageLog[req.SequenceNumber].FullPrepareRx = false // Reset proofs
-		n.MessageLog[req.SequenceNumber].FullCommitRx = false
-		n.MessageLog[req.SequenceNumber].PrepareVotes = make(map[int]*pb.PrepareRequest)
-		n.MessageLog[req.SequenceNumber].CommitVotes = make(map[int]*pb.CommitRequest)
+	entry, ok := n.MessageLog[req.SequenceNumber]
+	if !ok {
+		n.MessageLog[req.SequenceNumber] = newLogEntry(req)
+		return true
 	}
+
+	if req.SequenceNumber <= n.LastExecuted && !bytes.Equal(entry.Digest, d) {
+		log.Printf("Node %d: WARNING: PrePrepare for already-executed seq %d carries a different request", n.ID, req.SequenceNumber)
+	}
+
+	// Entry exists, replace it with the new view's proposal
+	entry.View = req.View
+	entry.Digest = d
+	entry.Request = req.Request
+	entry.Status = StatusPrePrepared
+	entry.PrePrepareMsg = req
+	entry.FullPrepareRx = false // Reset proofs
+	entry.FullCommitRx = false
+	entry.PrepareVotes = make(map[int]*pb.PrepareRequest)
+	entry.CommitVotes = make(map[int]*pb.CommitRequest)
 	return true
 }
 
@@ -1785,6 +2025,16 @@ func (n *Node) SendCheckpoint(ctx context.Context, req *pb.Checkpoint) (*pb.Ack,
 	log.Printf("Node %d received Checkpoint from %d for seq %d", n.ID, req.ReplicaId, req.SequenceNumber)
 	// TODO: Implement Checkpoint collection and state
 	return &pb.Ack{Success: true, ErrorMessage: "unimplemented"}, nil
+}
+
+// displayStatus is the status shown by printlog/printstatus. Execution is strictly in
+// order, so every seq up to LastExecuted is executed even if a later view re-proposed it.
+// MUST be called with the lock held.
+func (n *Node) displayStatus(entry *InternalLogEntry) string {
+	if entry.SequenceNumber <= n.LastExecuted {
+		return StatusExecuted
+	}
+	return entry.Status
 }
 
 // GetNodeState is called by the test harness
@@ -1805,14 +2055,14 @@ func (n *Node) GetNodeState(ctx context.Context, req *pb.StateRequest) (*pb.Stat
 
 	for _, seq := range keys {
 		entry := n.MessageLog[seq]
-		content := "NO-OP"
+		content := "UNKNOWN (awaiting request)"
 		if entry.Request != nil {
-			if entry.Request.ClientId == "no-op" {
+			if entry.Request.ClientId == NoOpClientID {
 				content = "NO-OP"
 			} else if entry.Request.Transaction != nil {
 				tx := entry.Request.Transaction
 				// Differentiate between read-write and read-only
-				if tx.Receiver == "" && tx.Amount == 0 {
+				if isReadOnly(tx) || isConsensusRead(tx) {
 					content = fmt.Sprintf("(%s)", tx.Sender) // Read-Only
 				} else {
 					content = fmt.Sprintf("(%s, %s, %d)", tx.Sender, tx.Receiver, tx.Amount)
@@ -1822,7 +2072,7 @@ func (n *Node) GetNodeState(ctx context.Context, req *pb.StateRequest) (*pb.Stat
 
 		simpleLog = append(simpleLog, &pb.LogEntry{
 			SequenceNumber: seq,
-			Status:         entry.Status,
+			Status:         n.displayStatus(entry),
 			Content:        content,
 			View:           entry.View,
 		})
@@ -1837,7 +2087,7 @@ func (n *Node) GetNodeState(ctx context.Context, req *pb.StateRequest) (*pb.Stat
 	status := "X" // Not Found
 	if req.SequenceNumber > 0 {
 		if entry, ok := n.MessageLog[req.SequenceNumber]; ok {
-			status = entry.Status
+			status = n.displayStatus(entry)
 			if status == "" {
 				status = "X"
 			}
@@ -1845,13 +2095,8 @@ func (n *Node) GetNodeState(ctx context.Context, req *pb.StateRequest) (*pb.Stat
 	}
 
 	// --- Build ViewChange history for PrintView ---
-	viewChanges := make([]*pb.ViewChangeRequest, 0)
-	// Just grab all the votes we have for all views
-	for _, viewMap := range n.viewChangeVotes {
-		for _, vcMsg := range viewMap {
-			viewChanges = append(viewChanges, vcMsg)
-		}
-	}
+	viewChanges := make([]*pb.ViewChangeRequest, len(n.viewChangeHistory))
+	copy(viewChanges, n.viewChangeHistory)
 
 	return &pb.StateReply{
 		NodeId:               int32(n.ID),
